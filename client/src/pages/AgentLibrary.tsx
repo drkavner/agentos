@@ -18,7 +18,7 @@ const DIVISIONS = ["All", "Engineering", "Design", "Marketing", "Marketing Ops",
 export default function AgentLibrary() {
   const [search, setSearch] = useState("");
   const [division, setDivision] = useState("All");
-  const [source, setSource] = useState<"all" | "agency-agents" | "ai-marketing-skills">("all");
+
   const [selected, setSelected] = useState<AgentDefinition | null>(null);
   // Wizard state: null = closed, { def: null } = open without preselection, { def } = open with preselection
   const [wizard, setWizard] = useState<{ open: boolean; def: AgentDefinition | null }>({ open: false, def: null });
@@ -32,9 +32,8 @@ export default function AgentLibrary() {
 
   const filtered = defs.filter(d => {
     const matchDivision = division === "All" || d.division === division;
-    const matchSource = source === "all" || d.source === source;
     const matchSearch = !search || d.name.toLowerCase().includes(search.toLowerCase()) || d.specialty.toLowerCase().includes(search.toLowerCase()) || d.description.toLowerCase().includes(search.toLowerCase());
-    return matchDivision && matchSource && matchSearch;
+    return matchDivision && matchSearch;
   });
 
   const divisionCounts = DIVISIONS.reduce((acc, div) => {
@@ -47,7 +46,7 @@ export default function AgentLibrary() {
       <div className="flex items-start justify-between gap-4">
         <div>
           <h1 className="text-xl font-bold text-foreground">Agent Library</h1>
-          <p className="text-sm text-muted-foreground mt-0.5">{defs.length} specialized agents across {DIVISIONS.length - 1} divisions — from agency-agents and ai-marketing-skills</p>
+          <p className="text-sm text-muted-foreground mt-0.5">{defs.length} specialized agents across {DIVISIONS.length - 1} divisions</p>
         </div>
         <Button onClick={() => openWizard()} data-testid="hire-from-library-btn">
           <Plus className="w-4 h-4 mr-1.5" /> Hire Agent
@@ -66,19 +65,7 @@ export default function AgentLibrary() {
             data-testid="library-search"
           />
         </div>
-        <div className="flex gap-2">
-          {(["all", "agency-agents", "ai-marketing-skills"] as const).map(s => (
-            <Button
-              key={s}
-              variant={source === s ? "default" : "outline"}
-              size="sm"
-              onClick={() => setSource(s)}
-              data-testid={`source-filter-${s}`}
-            >
-              {s === "all" ? "All Sources" : s}
-            </Button>
-          ))}
-        </div>
+
       </div>
 
       {/* Division tabs */}
@@ -123,9 +110,7 @@ export default function AgentLibrary() {
                     </Badge>
                   </div>
                 </div>
-                <Badge variant={def.source === "ai-marketing-skills" ? "default" : "secondary"} className="text-xs py-0 shrink-0">
-                  {def.source === "ai-marketing-skills" ? "mktg" : "agency"}
-                </Badge>
+
               </div>
             </CardHeader>
             <CardContent className="px-4 pb-3">
@@ -179,12 +164,7 @@ export default function AgentLibrary() {
                 <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">When to Use</h4>
                 <p className="text-sm text-foreground">{selected.whenToUse}</p>
               </div>
-              <div>
-                <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">Source</h4>
-                <Badge variant={selected.source === "ai-marketing-skills" ? "default" : "secondary"}>
-                  {selected.source}
-                </Badge>
-              </div>
+
             </div>
             <DialogFooter>
               <Button variant="outline" onClick={() => setSelected(null)}>Close</Button>
