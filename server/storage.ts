@@ -248,7 +248,28 @@ export class DatabaseStorage implements IStorage {
   }
   createMessage(data: InsertMessage) {
     const now = new Date().toISOString();
-    return db.insert(messages).values({ ...data, createdAt: now }).returning().get();
+    // Drizzle's sqlite driver expects `text` columns to receive strings (or null).
+    // Some callsites pass objects (e.g. `metadata`) via `as any`, which can crash
+    // better-sqlite3 parameter binding at runtime.
+    const anyData = data as any;
+    const metadata =
+      anyData?.metadata === undefined || anyData?.metadata === null
+        ? undefined
+        : typeof anyData.metadata === "string"
+          ? anyData.metadata
+          : JSON.stringify(anyData.metadata);
+
+    const row: any = {
+      ...anyData,
+      channelType: anyData.channelType ?? "team",
+      senderName: anyData.senderName ?? "System",
+      senderEmoji: anyData.senderEmoji ?? "🤖",
+      messageType: anyData.messageType ?? "chat",
+      metadata,
+      createdAt: now,
+    };
+
+    return db.insert(messages).values(row).returning().get();
   }
 
   // ─── Goals ────────────────────────────────────────────────────────────────
