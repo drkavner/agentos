@@ -1,0 +1,55 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1776087274765,
+      "tag": "0000_stiff_centennial",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1776087838279,
+      "tag": "0001_purple_switch",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1776088175727,
+      "tag": "0002_chunky_loa",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1776089825731,
+      "tag": "0003_pale_rawhide_kid",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1776122721511,
+      "tag": "0004_worried_giant_man",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1776166981383,
+      "tag": "0005_true_rockslide",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1776200000000,
+      "tag": "0006_ollama_tenant_url",
+      "breakpoints": true
+    }
+  ]
+}

@@ -1,36 +1,390 @@
 import type { Express, Request, Response } from "express";
 import type { Server } from "http";
 import { storage } from "./storage";
-import { seedDatabase } from "./seed";
+import { ApiError } from "./apiError";
+import fs from "fs";
+import path from "path";
+import { db } from "./db";
+import { sql } from "drizzle-orm";
+import { setupTenantSseRoute } from "./tenantEvents";
+import { auditAndInvalidate, invalidateTenant, invalidateTenantsList } from "./realtimeSideEffects";
+import { getEffectiveDefinitionSkills } from "./skillsRuntime";
+import { hermesRunOnce } from "./hermesAdapter";
+import { collaborationAfterUserMessage, openclawRunOnce } from "./openclawAdapter";
+import { buildAgentSystemPrompt } from "./agentPrompts";
+import {
+  getLlmServerStatus,
+  listOllamaModels,
+  normalizeLlmRouting,
+  resolveOllamaBaseUrl,
+  sanitizeOllamaProbeUrl,
+} from "./llmClient";
 import {
   insertTenantSchema, insertAgentSchema, insertTeamSchema,
   insertTeamMemberSchema, insertTaskSchema, insertMessageSchema,
-  insertGoalSchema
+  insertGoalSchema,
+  upsertAgentDefinitionSkillsSchema,
+  upsertCeoFileSchema,
+  upsertCeoInstructionSettingsSchema,
 } from "@shared/schema";
+import { ensureDir, safeJoin, listMarkdownFiles, readFileUtf8, writeFileUtf8, deleteFileIfExists, managedRootPathForPaperclip } from "./ceoInstructions";
+import { ensureCortexSkillsTables } from "./cortexSkills";
+import {
+  createAgentApiKey,
+  ensureAgentConfigurationTables,
+  getAgentProfile,
+  getAgentRuntimeSettings,
+  listAgentApiKeys,
+  secondsToCron,
+  upsertAgentProfile,
+  upsertAgentRuntimeSettings,
+} from "./agentConfiguration";
+import { ensureAgentRunsTables, getAgentRun, getRunEvents, listAgentRuns } from "./agentRuns";
+import { ensureAgentBudgetTables, getAgentBudgetSettings, updateAgentBudgetSettings } from "./agentBudgets";
+import { ensureCeoControlTable, getCeoControlMode, setCeoControlMode } from "./ceoControl";
+import { createDefaultCeoForTenant } from "./ceoBootstrap";
+
+const patchTenantSchema = insertTenantSchema.partial();
+
+function slugify(input: string) {
+  return input
+    .trim()
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+}
+
+function renderDefinitionSkillsMd(def: { id: number; name: string; division: string; specialty: string; description: string; whenToUse: string; source: string }) {
+  const skills = def.specialty
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const bullets = skills.length ? skills : [def.specialty];
+  return `# ${def.name} — Skills
+
+## Summary
+${def.description}
+
+## Division
+${def.division}
+
+## Skills
+${bullets.map((b) => `- ${b}`).join("\n")}
+
+## When to use
+${def.whenToUse}
+
+## Source
+${def.source}
+`;
+}
+
+function zodDetails(error: unknown) {
+  // Keep response small + consistent for clients.
+  // (ZodError has .issues, but we avoid importing Zod types here.)
+  return error;
+}
 
 export async function registerRoutes(httpServer: Server, app: Express) {
-  // Seed on startup
-  seedDatabase();
+  setupTenantSseRoute(app, (id) => storage.getTenant(id));
 
   // ─── Tenants ──────────────────────────────────────────────────────────────
   app.get("/api/tenants", (req, res) => res.json(storage.getTenants()));
   app.get("/api/tenants/:id", (req, res) => {
     const t = storage.getTenant(Number(req.params.id));
-    if (!t) return res.status(404).json({ error: "Not found" });
+    if (!t) throw new ApiError(404, "not_found", "Tenant not found");
     res.json(t);
   });
+
+  /** List models from the org’s Ollama instance (`GET …/api/tags`). Optional `?url=` probes before saving the org URL. */
+  app.get("/api/tenants/:tenantId/ollama/models", async (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const tenant = storage.getTenant(tenantId);
+    if (!tenant) throw new ApiError(404, "not_found", "Tenant not found");
+    const rawQ = typeof req.query.url === "string" ? req.query.url : null;
+    const override = sanitizeOllamaProbeUrl(rawQ);
+    const base = override ?? resolveOllamaBaseUrl(tenant.ollamaBaseUrl);
+    const result = await listOllamaModels(base);
+    if (!result.ok) {
+      throw new ApiError(502, "ollama_list_failed", result.error);
+    }
+    res.json({ baseUsed: result.baseUsed, models: result.models });
+  });
+  console.log("[express] Registered GET /api/tenants/:tenantId/ollama/models (Ollama model list)");
+
   app.post("/api/tenants", (req, res) => {
     const parsed = insertTenantSchema.safeParse(req.body);
-    if (!parsed.success) return res.status(400).json({ error: parsed.error });
-    res.json(storage.createTenant(parsed.data));
+    if (!parsed.success) throw new ApiError(400, "validation_error", "Invalid request", zodDetails(parsed.error));
+    const t = storage.createTenant(parsed.data);
+    auditAndInvalidate(t.id, ["tenant"], {
+      action: "org_created",
+      entity: "tenant",
+      entityId: String(t.id),
+      detail: `Created organization "${t.name}"`,
+      tokensUsed: 0,
+      cost: 0,
+    });
+
+    // Every org gets a CEO agent + default instruction files (catalog is ensured inside).
+    try {
+      createDefaultCeoForTenant(t.id, t.name);
+    } catch (e: any) {
+      throw new ApiError(
+        500,
+        "ceo_bootstrap_failed",
+        "Organization was created but default CEO setup failed. Restart the server to repair, or delete this org and try again.",
+        { cause: String(e?.message ?? e) },
+      );
+    }
+
+    invalidateTenantsList();
+    res.json(t);
   });
+
+  // ─── CEO Files (AGENTS/HEARTBEAT/SOUL/TOOLS) ───────────────────────────────
+  app.get("/api/tenants/:tenantId/ceo/instructions/settings", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    if (!storage.getTenant(tenantId)) throw new ApiError(404, "not_found", "Tenant not found");
+    const s = storage.getCeoInstructionSettings(tenantId);
+    res.json(s);
+  });
+
+  app.put("/api/tenants/:tenantId/ceo/instructions/settings", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    if (!storage.getTenant(tenantId)) throw new ApiError(404, "not_found", "Tenant not found");
+    const parsed = upsertCeoInstructionSettingsSchema.safeParse(req.body);
+    if (!parsed.success) throw new ApiError(400, "validation_error", "Invalid request", zodDetails(parsed.error));
+    const s = storage.upsertCeoInstructionSettings(tenantId, parsed.data);
+
+    // External mode UX: ensure the entry file exists (and only that file is required).
+    if (parsed.data.mode === "external") {
+      try {
+        ensureDir(parsed.data.rootPath);
+        const entry = safeJoin(parsed.data.rootPath, parsed.data.entryFile || "AGENTS.md");
+        if (!fs.existsSync(entry)) {
+          writeFileUtf8(entry, "# Agent instructions\n\n");
+        }
+      } catch {
+        // ignore: external path may not be writable
+      }
+    }
+
+    auditAndInvalidate(tenantId, ["ceo_files"], {
+      action: "ceo_instruction_settings_saved",
+      entity: "ceo_instruction_settings",
+      entityId: String(tenantId),
+      detail: `Saved CEO instruction settings (${parsed.data.mode})`,
+      tokensUsed: 0,
+      cost: 0,
+    });
+    res.json({ ok: true, ...s });
+  });
+
+  app.get("/api/tenants/:tenantId/ceo/files", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    if (!storage.getTenant(tenantId)) throw new ApiError(404, "not_found", "Tenant not found");
+    const settings = storage.getCeoInstructionSettings(tenantId);
+    const mode = settings.mode === "external" ? "external" : "managed";
+    const ident = mode === "managed" ? storage.getOrCreatePaperclipIdentity(tenantId) : null;
+    const rootPath = mode === "managed"
+      ? managedRootPathForPaperclip(ident!.companyId, ident!.ceoPaperclipAgentId)
+      : settings.rootPath;
+    const entryFile = settings.entryFile || "AGENTS.md";
+
+    const defaults: Record<string, string> = {
+      "AGENTS.md": `You are the CEO. Your job is to lead the company, not to do individual contributor work.\nYou own strategy, prioritization, and cross-functional coordination.\n\n## Delegation (critical)\nYou MUST delegate work rather than doing it yourself.\n\nRouting rules:\n- Code, bugs, features, infra, devtools → CTO\n- Marketing, content, social media, growth, devrel → CMO\n- UX, design, user research, design-system → UXDesigner\n`,
+      "HEARTBEAT.md": `# HEARTBEAT.md — CEO Heartbeat Checklist\n\nRun this checklist on every heartbeat.\n\n1. Identity and Context\n2. Local Planning Check\n3. Approval Follow-Up\n4. Get Assignments\n5. Delegation\n6. Exit\n`,
+      "SOUL.md": `# SOUL.md — CEO Persona\n\n- Default to action\n- Delegate execution\n- Stay close to the customer\n`,
+      "TOOLS.md": `# Tools\n\n(Your tools will go here. Add notes about them as you acquire and use them.)\n`,
+    };
+
+    if (!rootPath) throw new ApiError(400, "missing_root_path", "Root path is required");
+    ensureDir(rootPath);
+
+    // If managed mode: ensure on-disk bundle exists (mirror DB or defaults).
+    if (mode === "managed") {
+      const existingDb = storage.getCeoFiles(tenantId);
+      if (existingDb.length === 0) {
+        for (const [filename, markdown] of Object.entries(defaults)) {
+          storage.upsertCeoFile(tenantId, filename, { filename, markdown });
+        }
+        auditAndInvalidate(tenantId, ["ceo_files"], {
+          action: "ceo_files_created",
+          entity: "ceo_files",
+          entityId: String(tenantId),
+          detail: "Backfilled default CEO instruction files",
+          tokensUsed: 0,
+          cost: 0,
+        });
+      }
+      const dbFiles = storage.getCeoFiles(tenantId);
+      for (const f of dbFiles) {
+        const full = safeJoin(rootPath, f.filename);
+        if (!fs.existsSync(full)) {
+          writeFileUtf8(full, f.markdown);
+        }
+      }
+    } else {
+      // External: never seed defaults. Only show what's truly on disk.
+    }
+
+    let names = listMarkdownFiles(rootPath);
+    if (mode === "external") {
+      // External mode should expose ONLY the configured entry file in the UI,
+      // even if the folder contains other markdown files.
+      const want = entryFile || "AGENTS.md";
+      names = names.filter((n) => n === want);
+    }
+    const now = new Date().toISOString();
+    const out = names.map((filename) => {
+      const full = safeJoin(rootPath, filename);
+      const markdown = readFileUtf8(full);
+      // Keep DB mirror in sync for Managed (and also useful for search/audit).
+      if (mode === "managed") {
+        storage.upsertCeoFile(tenantId, filename, { filename, markdown });
+      }
+      return { id: 0, tenantId, filename, markdown, updatedAt: now, rootPath, entryFile };
+    });
+    res.json(out);
+  });
+
+  app.put("/api/tenants/:tenantId/ceo/files/:filename", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const filename = String(req.params.filename || "");
+    if (!storage.getTenant(tenantId)) throw new ApiError(404, "not_found", "Tenant not found");
+    const settings = storage.getCeoInstructionSettings(tenantId);
+    const mode = settings.mode === "external" ? "external" : "managed";
+    const ident = mode === "managed" ? storage.getOrCreatePaperclipIdentity(tenantId) : null;
+    const rootPath = mode === "managed"
+      ? managedRootPathForPaperclip(ident!.companyId, ident!.ceoPaperclipAgentId)
+      : settings.rootPath;
+    if (!rootPath) throw new ApiError(400, "missing_root_path", "Root path is required");
+    ensureDir(rootPath);
+
+    const parsed = upsertCeoFileSchema.safeParse({ filename, markdown: req.body?.markdown });
+    if (!parsed.success) throw new ApiError(400, "validation_error", "Invalid request", zodDetails(parsed.error));
+    const full = safeJoin(rootPath, filename);
+    writeFileUtf8(full, parsed.data.markdown);
+    const row =
+      mode === "managed"
+        ? storage.upsertCeoFile(tenantId, filename, parsed.data)
+        : { id: 0, tenantId, filename, markdown: parsed.data.markdown, updatedAt: new Date().toISOString() };
+    auditAndInvalidate(tenantId, ["ceo_files"], {
+      action: "ceo_file_saved",
+      entity: "ceo_file",
+      entityId: filename,
+      detail: `Saved ${filename}`,
+      tokensUsed: 0,
+      cost: 0,
+    });
+    res.json(row);
+  });
+
+  app.delete("/api/tenants/:tenantId/ceo/files/:filename", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const filename = String(req.params.filename || "");
+    if (!storage.getTenant(tenantId)) throw new ApiError(404, "not_found", "Tenant not found");
+    const settings = storage.getCeoInstructionSettings(tenantId);
+    const mode = settings.mode === "external" ? "external" : "managed";
+    const ident = mode === "managed" ? storage.getOrCreatePaperclipIdentity(tenantId) : null;
+    const rootPath = mode === "managed"
+      ? managedRootPathForPaperclip(ident!.companyId, ident!.ceoPaperclipAgentId)
+      : settings.rootPath;
+    if (rootPath) {
+      try {
+        const full = safeJoin(rootPath, filename);
+        deleteFileIfExists(full);
+      } catch {
+        // ignore
+      }
+    }
+    if (mode === "managed") {
+      storage.deleteCeoFile(tenantId, filename);
+    }
+    auditAndInvalidate(tenantId, ["ceo_files"], {
+      action: "ceo_file_deleted",
+      entity: "ceo_file",
+      entityId: filename,
+      detail: `Deleted ${filename}`,
+      tokensUsed: 0,
+      cost: 0,
+    });
+    res.json({ ok: true });
+  });
+
+  // ─── CEO Skills Library (Cortex skills) ────────────────────────────────────
+  app.get("/api/tenants/:tenantId/ceo/skills", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    if (!storage.getTenant(tenantId)) throw new ApiError(404, "not_found", "Tenant not found");
+    ensureCortexSkillsTables();
+    const rows = db.all(sql`
+      SELECT
+        l.slug as slug,
+        l.name as name,
+        l.updated_at as updatedAt,
+        COALESCE(t.selected, 1) as selected
+      FROM cortex_skills_library l
+      LEFT JOIN tenant_cortex_skills t
+        ON t.slug = l.slug AND t.tenant_id = ${tenantId}
+      ORDER BY l.slug ASC
+    `) as any[];
+    const required = new Set(["cortex", "cortex-create-agent", "cortex-create-plugin", "para-memory-files"]);
+    res.json(rows.map((r) => ({
+      slug: r.slug,
+      name: r.name,
+      required: required.has(r.slug),
+      selected: required.has(r.slug) ? true : !!r.selected,
+      updatedAt: r.updatedAt,
+    })));
+  });
+
+  app.get("/api/tenants/:tenantId/ceo/skills/:slug", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const slug = String(req.params.slug || "");
+    if (!storage.getTenant(tenantId)) throw new ApiError(404, "not_found", "Tenant not found");
+    ensureCortexSkillsTables();
+    const row = db.get(sql`
+      SELECT slug, name, markdown, updated_at as updatedAt
+      FROM cortex_skills_library
+      WHERE slug = ${slug}
+    `) as any | undefined;
+    if (!row) throw new ApiError(404, "not_found", "Skill not found");
+    res.json({ slug: row.slug, name: row.name, markdown: row.markdown, updatedAt: row.updatedAt });
+  });
+
   app.patch("/api/tenants/:id", (req, res) => {
-    const t = storage.updateTenant(Number(req.params.id), req.body);
-    if (!t) return res.status(404).json({ error: "Not found" });
+    const id = Number(req.params.id);
+    const parsed = patchTenantSchema.safeParse(req.body);
+    if (!parsed.success) throw new ApiError(400, "validation_error", "Invalid request", zodDetails(parsed.error));
+    const t = storage.updateTenant(id, parsed.data);
+    if (!t) throw new ApiError(404, "not_found", "Tenant not found");
+    auditAndInvalidate(id, ["tenant"], {
+      action: "org_updated",
+      entity: "tenant",
+      entityId: String(id),
+      detail: "Organization settings updated",
+      tokensUsed: 0,
+      cost: 0,
+    });
+    invalidateTenant(id, ["tenant"]);
+    invalidateTenantsList();
     res.json(t);
   });
   app.delete("/api/tenants/:id", (req, res) => {
-    storage.deleteTenant(Number(req.params.id));
+    const id = Number(req.params.id);
+    invalidateTenant(id, ["agents", "tasks", "goals", "messages", "teams", "audit", "tenant"]);
+    auditAndInvalidate(id, ["tenant", "agents", "tasks", "goals", "messages", "teams", "audit"], {
+      action: "org_deleted",
+      entity: "tenant",
+      entityId: String(id),
+      detail: "Organization deleted",
+      tokensUsed: 0,
+      cost: 0,
+    });
+    storage.deleteTenant(id);
+    invalidateTenantsList();
     res.json({ ok: true });
   });
 
@@ -39,6 +393,133 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   app.get("/api/agent-definitions/division/:division", (req, res) =>
     res.json(storage.getAgentDefinitionsByDivision(req.params.division))
   );
+  app.get("/api/agent-definitions/:id/skills", async (req, res) => {
+    const id = Number(req.params.id);
+    const def = storage.getAgentDefinition(id);
+    if (!def) throw new ApiError(404, "not_found", "Agent definition not found");
+
+    const outRoot = path.join(process.cwd(), "agent-library", "agent-definitions");
+    const folder = `${slugify(def.name)}__${def.id}`;
+    const skillsPath = path.join(outRoot, folder, "skills.md");
+
+    const tenantId = Number(req.query.tenantId);
+    if (!Number.isFinite(tenantId) || !storage.getTenant(tenantId)) {
+      // Preserve old behavior when no tenant is provided.
+      try {
+        const md = await fs.promises.readFile(skillsPath, "utf-8");
+        res.json({ markdown: md, source: "file" });
+        return;
+      } catch {
+        res.json({
+          markdown: renderDefinitionSkillsMd({
+            id: def.id,
+            name: def.name,
+            division: def.division,
+            specialty: def.specialty,
+            description: def.description,
+            whenToUse: def.whenToUse,
+            source: def.source,
+          }),
+          source: "generated",
+        });
+        return;
+      }
+    }
+
+    const effective = await getEffectiveDefinitionSkills(tenantId, def.id);
+    res.json(effective);
+  });
+
+  app.put("/api/tenants/:tenantId/agent-definitions/:definitionId/skills", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const definitionId = Number(req.params.definitionId);
+    if (!storage.getTenant(tenantId)) throw new ApiError(404, "not_found", "Tenant not found");
+    if (!storage.getAgentDefinition(definitionId)) throw new ApiError(404, "not_found", "Agent definition not found");
+
+    const parsed = upsertAgentDefinitionSkillsSchema.safeParse(req.body);
+    if (!parsed.success) throw new ApiError(400, "validation_error", "Invalid request", zodDetails(parsed.error));
+
+    const row = storage.upsertAgentDefinitionSkills(tenantId, definitionId, parsed.data);
+    auditAndInvalidate(tenantId, ["audit"], {
+      action: "skills_updated",
+      entity: "agent_definition",
+      entityId: String(definitionId),
+      detail: "Updated Agent Library skills.md",
+      tokensUsed: 0,
+      cost: 0,
+    });
+    invalidateTenant(tenantId, ["tenant"]);
+    res.json({ ok: true, ...row });
+  });
+
+  // Runtime context: adapters use this to run agents with the exact skills.md.
+  app.get("/api/tenants/:tenantId/agents/:agentId/runtime-context", async (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const agentId = Number(req.params.agentId);
+    const tenant = storage.getTenant(tenantId);
+    if (!tenant) throw new ApiError(404, "not_found", "Tenant not found");
+    const agent = storage.getAgent(agentId);
+    if (!agent || agent.tenantId !== tenantId) throw new ApiError(404, "not_found", "Agent not found");
+    const def = storage.getAgentDefinition(agent.definitionId);
+    if (!def) throw new ApiError(404, "not_found", "Agent definition not found");
+
+    const skills = await getEffectiveDefinitionSkills(tenantId, def.id);
+    ensureAgentConfigurationTables();
+    const runtime = getAgentRuntimeSettings(agentId);
+    const systemPrompt = await buildAgentSystemPrompt(tenantId, agentId);
+
+    res.json({
+      tenant: { id: tenant.id, name: tenant.name, adapterType: tenant.adapterType },
+      agent,
+      definition: def,
+      skills,
+      runtime,
+      systemPrompt,
+    });
+  });
+
+  // In-app run: Hermes (LLM loop) or OpenClaw (recorded run + gateway-oriented message). Same URL for UI parity.
+  app.post("/api/tenants/:tenantId/agents/:agentId/hermes/run-once", async (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const agentId = Number(req.params.agentId);
+    const tenantRow = storage.getTenant(tenantId);
+    if (!tenantRow) throw new ApiError(404, "not_found", "Tenant not found");
+
+    if (tenantRow.adapterType === "openclaw") {
+      const result = await openclawRunOnce(tenantId, agentId, { reason: "manual" });
+      if (!result.ok) {
+        throw new ApiError(400, "cannot_run", `OpenClaw run failed: ${result.error}`);
+      }
+      auditAndInvalidate(tenantId, ["agents", "tasks", "messages", "goals"], {
+        agentId,
+        agentName: storage.getAgent(agentId)?.displayName ?? undefined,
+        action: "openclaw_run_once",
+        entity: "agent",
+        entityId: String(agentId),
+        detail: "OpenClaw run recorded in Cortex (gateway executes externally)",
+        tokensUsed: 0,
+        cost: 0,
+      });
+      res.json(result);
+      return;
+    }
+
+    const result = await hermesRunOnce(tenantId, agentId, { reason: "manual" });
+    if (!result.ok) {
+      throw new ApiError(400, "cannot_run", `Hermes run failed: ${result.reason}`);
+    }
+    auditAndInvalidate(tenantId, ["agents", "tasks", "messages", "goals"], {
+      agentId,
+      agentName: storage.getAgent(agentId)?.displayName ?? undefined,
+      action: "hermes_run_once",
+      entity: "agent",
+      entityId: String(agentId),
+      detail: `Hermes executed work using skills source: ${result.skillsSource}`,
+      tokensUsed: result.tokensUsed,
+      cost: result.costUsd ?? 0,
+    });
+    res.json(result);
+  });
 
   // ─── Agents ───────────────────────────────────────────────────────────────
   app.get("/api/tenants/:tenantId/agents", (req, res) =>
@@ -47,29 +528,384 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   app.post("/api/tenants/:tenantId/agents", (req, res) => {
     const tenantId = Number(req.params.tenantId);
     const tenant = storage.getTenant(tenantId);
-    if (!tenant) return res.status(404).json({ error: "Tenant not found" });
+    if (!tenant) throw new ApiError(404, "not_found", "Tenant not found");
     // Enforce agent cap
     const current = storage.getAgents(tenantId);
     if (current.length >= tenant.maxAgents) {
-      return res.status(403).json({
-        error: "agent_limit_reached",
-        message: `Agent limit reached. This organization is capped at ${tenant.maxAgents} agents. Ask your admin to raise the limit in Settings.`,
-        limit: tenant.maxAgents,
-        current: current.length,
-      });
+      throw new ApiError(
+        403,
+        "agent_limit_reached",
+        `Agent limit reached. This organization is capped at ${tenant.maxAgents} agents. Ask your admin to raise the limit in Settings.`,
+        { limit: tenant.maxAgents, current: current.length },
+      );
     }
-    const parsed = insertAgentSchema.safeParse({ ...req.body, tenantId });
-    if (!parsed.success) return res.status(400).json({ error: parsed.error });
-    res.json(storage.createAgent(parsed.data));
+    const hireBody: Record<string, unknown> = { ...(req.body as object), tenantId };
+    const llmProvider = normalizeLlmRouting(hireBody.llmProvider);
+    delete hireBody.llmProvider;
+    const parsed = insertAgentSchema.safeParse(hireBody);
+    if (!parsed.success) throw new ApiError(400, "validation_error", "Invalid request", zodDetails(parsed.error));
+    const agent = storage.createAgent(parsed.data);
+    ensureAgentConfigurationTables();
+    upsertAgentRuntimeSettings(agent.id, { llmProvider });
+    auditAndInvalidate(tenantId, ["agents"], {
+      agentId: agent.id,
+      agentName: agent.displayName,
+      action: "agent_hired",
+      entity: "agent",
+      entityId: String(agent.id),
+      detail: `Deployed ${agent.displayName} as ${agent.role}`,
+      tokensUsed: 0,
+      cost: 0,
+    });
+    res.json(agent);
   });
-  app.patch("/api/agents/:id", (req, res) => {
-    const a = storage.updateAgent(Number(req.params.id), req.body);
-    if (!a) return res.status(404).json({ error: "Not found" });
+
+  // Agent configuration (profile + runtime settings + API keys)
+  app.get("/api/tenants/:tenantId/agents/:agentId/configuration", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const agentId = Number(req.params.agentId);
+    const agent = storage.getAgent(agentId);
+    if (!agent || agent.tenantId !== tenantId) throw new ApiError(404, "not_found", "Agent not found");
+    ensureAgentConfigurationTables();
+    // Ensure a row exists so defaults are materialized in DB.
+    upsertAgentRuntimeSettings(agentId, {});
+    res.json({
+      profile: getAgentProfile(agentId),
+      runtime: getAgentRuntimeSettings(agentId),
+      apiKeys: listAgentApiKeys(agentId),
+    });
+  });
+
+  app.put("/api/tenants/:tenantId/agents/:agentId/configuration", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const agentId = Number(req.params.agentId);
+    const agent = storage.getAgent(agentId);
+    if (!agent || agent.tenantId !== tenantId) throw new ApiError(404, "not_found", "Agent not found");
+    ensureAgentConfigurationTables();
+
+    const body: any = req.body ?? {};
+    if (body.profile) upsertAgentProfile(agentId, body.profile);
+    if (body.runtime) {
+      upsertAgentRuntimeSettings(agentId, body.runtime);
+
+      // Make heartbeat controls "real": sync to agent status + cron schedule
+      if (body.runtime.heartbeatEverySec !== undefined) {
+        const cron = secondsToCron(Number(body.runtime.heartbeatEverySec));
+        storage.updateAgent(agentId, { heartbeatSchedule: cron });
+      }
+      if (body.runtime.heartbeatEnabled !== undefined) {
+        const enabled = !!body.runtime.heartbeatEnabled;
+        const nextStatus = enabled ? "running" : (agent.status === "terminated" ? "terminated" : "idle");
+        storage.updateAgent(agentId, { status: nextStatus });
+      }
+    }
+
+    auditAndInvalidate(tenantId, ["agents"], {
+      agentId,
+      agentName: agent.displayName,
+      action: "agent_config_updated",
+      entity: "agent",
+      entityId: String(agentId),
+      detail: "Updated agent runtime settings",
+      tokensUsed: 0,
+      cost: 0,
+    });
+    res.json({
+      profile: getAgentProfile(agentId),
+      runtime: getAgentRuntimeSettings(agentId),
+      apiKeys: listAgentApiKeys(agentId),
+    });
+  });
+
+  app.post("/api/tenants/:tenantId/agents/:agentId/api-keys", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const agentId = Number(req.params.agentId);
+    const agent = storage.getAgent(agentId);
+    if (!agent || agent.tenantId !== tenantId) throw new ApiError(404, "not_found", "Agent not found");
+    ensureAgentConfigurationTables();
+    const name = String(req.body?.name ?? "").trim();
+    if (!name) throw new ApiError(400, "validation_error", "Key name required");
+    const created = createAgentApiKey(agentId, name);
+    auditAndInvalidate(tenantId, ["agents"], {
+      agentId,
+      agentName: agent.displayName,
+      action: "api_key_created",
+      entity: "agent_api_key",
+      entityId: String(agentId),
+      detail: `Created API key "${name}"`,
+      tokensUsed: 0,
+      cost: 0,
+    });
+    res.json({ token: created.token, last4: created.last4, createdAt: created.createdAt });
+  });
+
+  // Test environment: verify adapter + run policy + (Hermes) dry run
+  app.post("/api/tenants/:tenantId/agents/:agentId/test-environment", async (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const agentId = Number(req.params.agentId);
+    const tenant = storage.getTenant(tenantId);
+    if (!tenant) throw new ApiError(404, "not_found", "Tenant not found");
+    const agent = storage.getAgent(agentId);
+    if (!agent || agent.tenantId !== tenantId) throw new ApiError(404, "not_found", "Agent not found");
+
+    ensureAgentConfigurationTables();
+    // materialize defaults
+    upsertAgentRuntimeSettings(agentId, {});
+    const runtime = getAgentRuntimeSettings(agentId);
+
+    const modelId = (runtime.model || "").trim() || agent.model;
+    const llm = getLlmServerStatus(runtime.llmProvider, modelId, tenant.ollamaBaseUrl);
+
+    let result: any = {
+      ok: true,
+      adapterType: tenant.adapterType,
+      runtime,
+      llm,
+    };
+    if (tenant.adapterType === "hermes") {
+      // Use manual so it exercises the run path and writes audit/messages.
+      const run = await hermesRunOnce(tenantId, agentId, { reason: "manual" });
+      result = { ...result, hermes: run };
+      if (!run.ok) result.ok = false;
+    } else {
+      result = {
+        ...result,
+        ok: true,
+        note: "Openclaw selected. Gateway connectivity is not validated yet in AgentOS.",
+      };
+    }
+
+    auditAndInvalidate(tenantId, ["audit", "agents", "messages", "tasks", "goals"], {
+      agentId,
+      agentName: agent.displayName,
+      action: "test_environment",
+      entity: "agent",
+      entityId: String(agentId),
+      detail: tenant.adapterType === "hermes" ? "Tested Hermes environment (run-once)" : "Tested environment settings",
+      tokensUsed: 0,
+      cost: 0,
+    });
+
+    res.json(result);
+  });
+
+  // Runs log (real)
+  app.get("/api/tenants/:tenantId/agents/:agentId/runs", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const agentId = Number(req.params.agentId);
+    const tenant = storage.getTenant(tenantId);
+    if (!tenant) throw new ApiError(404, "not_found", "Tenant not found");
+    const agent = storage.getAgent(agentId);
+    if (!agent || agent.tenantId !== tenantId) throw new ApiError(404, "not_found", "Agent not found");
+    ensureAgentRunsTables();
+    res.json(listAgentRuns(tenantId, agentId, Number(req.query.limit ?? 50)));
+  });
+
+  app.get("/api/tenants/:tenantId/agents/:agentId/runs/:runId", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const agentId = Number(req.params.agentId);
+    const runId = Number(req.params.runId);
+    const tenant = storage.getTenant(tenantId);
+    if (!tenant) throw new ApiError(404, "not_found", "Tenant not found");
+    const agent = storage.getAgent(agentId);
+    if (!agent || agent.tenantId !== tenantId) throw new ApiError(404, "not_found", "Agent not found");
+    ensureAgentRunsTables();
+    const run = getAgentRun(runId);
+    if (!run || run.tenantId !== tenantId || run.agentId !== agentId) throw new ApiError(404, "not_found", "Run not found");
+    res.json({ run, events: getRunEvents(runId) });
+  });
+
+  // Agent budget (real)
+  app.get("/api/tenants/:tenantId/agents/:agentId/budget", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const agentId = Number(req.params.agentId);
+    const tenant = storage.getTenant(tenantId);
+    if (!tenant) throw new ApiError(404, "not_found", "Tenant not found");
+    const agent = storage.getAgent(agentId);
+    if (!agent || agent.tenantId !== tenantId) throw new ApiError(404, "not_found", "Agent not found");
+
+    ensureAgentBudgetTables();
+    const settings = getAgentBudgetSettings(agentId);
+    const spent = agent.spentThisMonth ?? 0;
+    const cap = settings.enabled ? (settings.capUsd ?? agent.monthlyBudget ?? null) : null;
+    const remaining = cap != null ? Math.max(0, cap - spent) : null;
+    const health =
+      cap == null
+        ? "healthy"
+        : spent / Math.max(1, cap) >= settings.softAlertPct
+          ? "warning"
+          : "healthy";
+
+    res.json({
+      settings,
+      observed: { spentUsd: spent, capUsd: cap, remainingUsd: remaining },
+      health,
+    });
+  });
+
+  app.put("/api/tenants/:tenantId/agents/:agentId/budget", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const agentId = Number(req.params.agentId);
+    const tenant = storage.getTenant(tenantId);
+    if (!tenant) throw new ApiError(404, "not_found", "Tenant not found");
+    const agent = storage.getAgent(agentId);
+    if (!agent || agent.tenantId !== tenantId) throw new ApiError(404, "not_found", "Agent not found");
+
+    ensureAgentBudgetTables();
+    const enabled = req.body?.enabled;
+    const capUsd = req.body?.capUsd;
+    const softAlertPct = req.body?.softAlertPct;
+    const next = updateAgentBudgetSettings(agentId, { enabled, capUsd, softAlertPct });
+
+    // Keep legacy agent.monthlyBudget in sync when a cap is configured.
+    if (next.enabled && next.capUsd != null) {
+      storage.updateAgent(agentId, { monthlyBudget: Number(next.capUsd) } as any);
+    }
+
+    auditAndInvalidate(tenantId, ["agents", "audit"], {
+      agentId,
+      agentName: agent.displayName,
+      action: "budget_updated",
+      entity: "agent_budget",
+      entityId: String(agentId),
+      detail: next.enabled ? `Budget cap enabled (${next.capUsd ?? "—"})` : "Budget cap disabled",
+      tokensUsed: 0,
+      cost: 0,
+    });
+
+    res.json({ ok: true, settings: next });
+  });
+
+  // CEO control: "agent" vs "me"
+  app.get("/api/tenants/:tenantId/ceo/control", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    if (!storage.getTenant(tenantId)) throw new ApiError(404, "not_found", "Tenant not found");
+    ensureCeoControlTable();
+    res.json({ tenantId, mode: getCeoControlMode(tenantId) });
+  });
+
+  app.put("/api/tenants/:tenantId/ceo/control", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    if (!storage.getTenant(tenantId)) throw new ApiError(404, "not_found", "Tenant not found");
+    const mode = String(req.body?.mode ?? "agent") === "me" ? "me" : "agent";
+    ensureCeoControlTable();
+    const saved = setCeoControlMode(tenantId, mode);
+
+    // Side effects: if CEO is "me", pause/disable automated runs; if "agent", re-enable.
+    const ceo = storage.getAgents(tenantId).find((a) => String(a.role).toLowerCase() === "ceo") ?? null;
+    if (ceo) {
+      if (mode === "me") {
+        upsertAgentRuntimeSettings(ceo.id, { heartbeatEnabled: false });
+        storage.updateAgent(ceo.id, { status: "paused" } as any);
+      } else {
+        upsertAgentRuntimeSettings(ceo.id, { heartbeatEnabled: true });
+        storage.updateAgent(ceo.id, { status: "running" } as any);
+      }
+    }
+
+    auditAndInvalidate(tenantId, ["audit", "agents"], {
+      action: "ceo_control_updated",
+      entity: "ceo_control",
+      entityId: String(tenantId),
+      detail: mode === "me" ? "CEO is now controlled by you" : "CEO returned to agent control",
+      tokensUsed: 0,
+      cost: 0,
+      agentId: ceo?.id ?? null,
+      agentName: ceo?.displayName ?? null,
+    } as any);
+
+    res.json({ ok: true, ...saved });
+  });
+
+  app.patch("/api/agents/:id", async (req, res) => {
+    const id = Number(req.params.id);
+    const prev = storage.getAgent(id);
+    const a = storage.updateAgent(id, req.body);
+    if (!a) throw new ApiError(404, "not_found", "Agent not found");
+    const statusNote =
+      req.body?.status != null && prev?.status !== req.body.status
+        ? `Status: ${prev?.status} → ${req.body.status}`
+        : "Agent updated";
+    auditAndInvalidate(a.tenantId, ["agents"], {
+      agentId: a.id,
+      agentName: a.displayName,
+      action: "agent_updated",
+      entity: "agent",
+      entityId: String(a.id),
+      detail: statusNote,
+      tokensUsed: 0,
+      cost: 0,
+    });
+
+    // If user starts an agent under Hermes, run one quick loop using effective skills.md.
+    const becameRunning = req.body?.status === "running" && prev?.status !== "running";
+    const tenant = storage.getTenant(a.tenantId);
+    if (becameRunning && tenant?.adapterType === "hermes") {
+      try {
+        const result = await hermesRunOnce(a.tenantId, a.id, { reason: "start" });
+        if (result.ok) {
+          auditAndInvalidate(a.tenantId, ["agents", "tasks", "messages", "goals"], {
+            agentId: a.id,
+            agentName: a.displayName,
+            action: "hermes_run_once",
+            entity: "agent",
+            entityId: String(a.id),
+            detail: `Hermes executed work using skills source: ${result.skillsSource}`,
+            tokensUsed: result.tokensUsed,
+            cost: 0,
+          });
+        }
+      } catch {
+        // don't block status updates if the run fails
+      }
+    }
     res.json(a);
   });
   app.delete("/api/agents/:id", (req, res) => {
-    storage.deleteAgent(Number(req.params.id));
+    const id = Number(req.params.id);
+    const agent = storage.getAgent(id);
+    if (!agent) throw new ApiError(404, "not_found", "Agent not found");
+    if (String(agent.role).toLowerCase() === "ceo") {
+      throw new ApiError(403, "cannot_delete_ceo", "The CEO agent cannot be deleted.");
+    }
+    auditAndInvalidate(agent.tenantId, ["agents", "teams"], {
+      agentId: agent.id,
+      agentName: agent.displayName,
+      action: "agent_deleted",
+      entity: "agent",
+      entityId: String(agent.id),
+      detail: `Removed ${agent.displayName}`,
+      tokensUsed: 0,
+      cost: 0,
+    });
+    storage.deleteAgent(id);
     res.json({ ok: true });
+  });
+
+  app.post("/api/agents/:id/heartbeat", (req, res) => {
+    const id = Number(req.params.id);
+    const agent = storage.getAgent(id);
+    if (!agent) throw new ApiError(404, "not_found", "Agent not found");
+    const body = req.body ?? {};
+    const detail = typeof body.detail === "string" ? body.detail : "Heartbeat: agent checked in";
+    const tokensUsed = Number(body.tokensUsed) || 0;
+    const cost = Number(body.cost) || 0;
+    const now = new Date().toISOString();
+    const nextSpent = cost > 0 ? agent.spentThisMonth + cost : agent.spentThisMonth;
+    storage.updateAgent(id, { lastHeartbeat: now, ...(cost > 0 ? { spentThisMonth: nextSpent } : {}) });
+    const updated = storage.getAgent(id);
+    if (!updated) throw new ApiError(404, "not_found", "Agent not found");
+    auditAndInvalidate(agent.tenantId, ["agents"], {
+      agentId: id,
+      agentName: agent.displayName,
+      action: "heartbeat",
+      entity: "agent",
+      entityId: String(id),
+      detail,
+      tokensUsed,
+      cost,
+    });
+    res.json(updated);
   });
 
   // ─── Teams ────────────────────────────────────────────────────────────────
@@ -78,16 +914,44 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   );
   app.post("/api/tenants/:tenantId/teams", (req, res) => {
     const parsed = insertTeamSchema.safeParse({ ...req.body, tenantId: Number(req.params.tenantId) });
-    if (!parsed.success) return res.status(400).json({ error: parsed.error });
-    res.json(storage.createTeam(parsed.data));
+    if (!parsed.success) throw new ApiError(400, "validation_error", "Invalid request", zodDetails(parsed.error));
+    const team = storage.createTeam(parsed.data);
+    auditAndInvalidate(team.tenantId, ["teams"], {
+      action: "team_created",
+      entity: "team",
+      entityId: String(team.id),
+      detail: `Created team "${team.name}"`,
+      tokensUsed: 0,
+      cost: 0,
+    });
+    res.json(team);
   });
   app.patch("/api/teams/:id", (req, res) => {
     const t = storage.updateTeam(Number(req.params.id), req.body);
-    if (!t) return res.status(404).json({ error: "Not found" });
+    if (!t) throw new ApiError(404, "not_found", "Team not found");
+    auditAndInvalidate(t.tenantId, ["teams"], {
+      action: "team_updated",
+      entity: "team",
+      entityId: String(t.id),
+      detail: "Team settings updated",
+      tokensUsed: 0,
+      cost: 0,
+    });
     res.json(t);
   });
   app.delete("/api/teams/:id", (req, res) => {
-    storage.deleteTeam(Number(req.params.id));
+    const id = Number(req.params.id);
+    const team = storage.getTeam(id);
+    if (!team) throw new ApiError(404, "not_found", "Team not found");
+    auditAndInvalidate(team.tenantId, ["teams", "agents"], {
+      action: "team_deleted",
+      entity: "team",
+      entityId: String(id),
+      detail: `Deleted team "${team.name}"`,
+      tokensUsed: 0,
+      cost: 0,
+    });
+    storage.deleteTeam(id);
     res.json({ ok: true });
   });
 
@@ -97,11 +961,42 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   );
   app.post("/api/teams/:teamId/members", (req, res) => {
     const parsed = insertTeamMemberSchema.safeParse({ teamId: Number(req.params.teamId), agentId: req.body.agentId });
-    if (!parsed.success) return res.status(400).json({ error: parsed.error });
-    res.json(storage.addTeamMember(parsed.data));
+    if (!parsed.success) throw new ApiError(400, "validation_error", "Invalid request", zodDetails(parsed.error));
+    const m = storage.addTeamMember(parsed.data);
+    const team = storage.getTeam(m.teamId);
+    const agent = storage.getAgent(m.agentId);
+    if (team) {
+      auditAndInvalidate(team.tenantId, ["teams", "agents"], {
+        agentId: m.agentId,
+        agentName: agent?.displayName ?? undefined,
+        action: "team_member_added",
+        entity: "team",
+        entityId: String(m.teamId),
+        detail: agent ? `${agent.displayName} joined the team` : "Agent joined team",
+        tokensUsed: 0,
+        cost: 0,
+      });
+    }
+    res.json(m);
   });
   app.delete("/api/teams/:teamId/members/:agentId", (req, res) => {
-    storage.removeTeamMember(Number(req.params.teamId), Number(req.params.agentId));
+    const teamId = Number(req.params.teamId);
+    const agentId = Number(req.params.agentId);
+    const team = storage.getTeam(teamId);
+    const agent = storage.getAgent(agentId);
+    storage.removeTeamMember(teamId, agentId);
+    if (team) {
+      auditAndInvalidate(team.tenantId, ["teams", "agents"], {
+        agentId,
+        agentName: agent?.displayName ?? undefined,
+        action: "team_member_removed",
+        entity: "team",
+        entityId: String(teamId),
+        detail: agent ? `${agent.displayName} left the team` : "Agent removed from team",
+        tokensUsed: 0,
+        cost: 0,
+      });
+    }
     res.json({ ok: true });
   });
 
@@ -111,29 +1006,117 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   );
   app.post("/api/tenants/:tenantId/tasks", (req, res) => {
     const parsed = insertTaskSchema.safeParse({ ...req.body, tenantId: Number(req.params.tenantId) });
-    if (!parsed.success) return res.status(400).json({ error: parsed.error });
-    res.json(storage.createTask(parsed.data));
+    if (!parsed.success) throw new ApiError(400, "validation_error", "Invalid request", zodDetails(parsed.error));
+    const task = storage.createTask(parsed.data);
+    auditAndInvalidate(task.tenantId, ["tasks", "goals"], {
+      agentId: task.assignedAgentId ?? undefined,
+      action: "task_created",
+      entity: "task",
+      entityId: String(task.id),
+      detail: task.title,
+      tokensUsed: 0,
+      cost: 0,
+    });
+    res.json(task);
   });
   app.patch("/api/tasks/:id", (req, res) => {
-    const t = storage.updateTask(Number(req.params.id), req.body);
-    if (!t) return res.status(404).json({ error: "Not found" });
+    const id = Number(req.params.id);
+    const prev = storage.getTask(id);
+    const t = storage.updateTask(id, req.body);
+    if (!t) throw new ApiError(404, "not_found", "Task not found");
+    const statusChanged = !!prev && prev.status !== t.status;
+    if (statusChanged) {
+      // Always log status transitions (covers todo/review/blocked/etc.)
+      auditAndInvalidate(t.tenantId, ["tasks", "goals"], {
+        agentId: t.assignedAgentId ?? undefined,
+        action: "task_status_changed",
+        entity: "task",
+        entityId: String(t.id),
+        detail: `${prev!.status} → ${t.status}: ${t.title}`,
+        tokensUsed: 0,
+        cost: 0,
+      });
+    }
+
+    // Keep special "semantic" actions too.
+    if (prev && t.status === "done" && prev.status !== "done") {
+      auditAndInvalidate(t.tenantId, ["tasks", "goals"], {
+        agentId: t.assignedAgentId ?? undefined,
+        action: "task_completed",
+        entity: "task",
+        entityId: String(t.id),
+        detail: t.title,
+        tokensUsed: t.actualTokens ?? 0,
+        cost: 0,
+      });
+    } else if (prev && t.status === "in_progress" && prev.status !== "in_progress") {
+      auditAndInvalidate(t.tenantId, ["tasks", "goals"], {
+        agentId: t.assignedAgentId ?? undefined,
+        action: "task_checkout",
+        entity: "task",
+        entityId: String(t.id),
+        detail: `Started: ${t.title}`,
+        tokensUsed: 0,
+        cost: 0,
+      });
+    } else if (!statusChanged) {
+      invalidateTenant(t.tenantId, ["tasks", "goals"]);
+    }
     res.json(t);
   });
   app.delete("/api/tasks/:id", (req, res) => {
-    storage.deleteTask(Number(req.params.id));
+    const id = Number(req.params.id);
+    const task = storage.getTask(id);
+    if (!task) throw new ApiError(404, "not_found", "Task not found");
+    auditAndInvalidate(task.tenantId, ["tasks", "goals"], {
+      agentId: task.assignedAgentId ?? undefined,
+      action: "task_deleted",
+      entity: "task",
+      entityId: String(id),
+      detail: task.title,
+      tokensUsed: 0,
+      cost: 0,
+    });
+    storage.deleteTask(id);
     res.json({ ok: true });
   });
 
   // ─── Messages ─────────────────────────────────────────────────────────────
   app.get("/api/tenants/:tenantId/messages", (req, res) => {
     const { channelId } = req.query;
-    if (!channelId) return res.status(400).json({ error: "channelId required" });
+    if (!channelId) throw new ApiError(400, "validation_error", "channelId required");
     res.json(storage.getMessages(Number(req.params.tenantId), channelId as string));
   });
   app.post("/api/tenants/:tenantId/messages", (req, res) => {
     const parsed = insertMessageSchema.safeParse({ ...req.body, tenantId: Number(req.params.tenantId) });
-    if (!parsed.success) return res.status(400).json({ error: parsed.error });
-    res.json(storage.createMessage(parsed.data));
+    if (!parsed.success) throw new ApiError(400, "validation_error", "Invalid request", zodDetails(parsed.error));
+    const msg = storage.createMessage(parsed.data);
+    auditAndInvalidate(msg.tenantId, ["messages"], {
+      agentId: msg.senderAgentId ?? undefined,
+      agentName: msg.senderName,
+      action: "message_sent",
+      entity: "message",
+      entityId: String(msg.id),
+      detail: msg.content.length > 200 ? `${msg.content.slice(0, 200)}…` : msg.content,
+      tokensUsed: 0,
+      cost: 0,
+    });
+    void collaborationAfterUserMessage(
+      msg.tenantId,
+      msg.channelId,
+      msg.senderName,
+      msg.messageType,
+      msg.content,
+    ).catch((err) => {
+      console.warn("collaborationAfterUserMessage failed", {
+        tenantId: msg.tenantId,
+        channelId: msg.channelId,
+        senderName: msg.senderName,
+        messageType: msg.messageType,
+        error: String(err?.message ?? err),
+      });
+    });
+    res.json(msg);
   });
 
   // ─── Goals ────────────────────────────────────────────────────────────────
@@ -142,26 +1125,54 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   );
   app.post("/api/tenants/:tenantId/goals", (req, res) => {
     const parsed = insertGoalSchema.safeParse({ ...req.body, tenantId: Number(req.params.tenantId) });
-    if (!parsed.success) return res.status(400).json({ error: parsed.error });
-    res.json(storage.createGoal(parsed.data));
+    if (!parsed.success) throw new ApiError(400, "validation_error", "Invalid request", zodDetails(parsed.error));
+    const g = storage.createGoal(parsed.data);
+    auditAndInvalidate(g.tenantId, ["goals"], {
+      action: "goal_created",
+      entity: "goal",
+      entityId: String(g.id),
+      detail: g.title,
+      tokensUsed: 0,
+      cost: 0,
+    });
+    res.json(g);
   });
   app.patch("/api/goals/:id", (req, res) => {
     const g = storage.updateGoal(Number(req.params.id), req.body);
-    if (!g) return res.status(404).json({ error: "Not found" });
+    if (!g) throw new ApiError(404, "not_found", "Goal not found");
+    auditAndInvalidate(g.tenantId, ["goals"], {
+      action: "goal_updated",
+      entity: "goal",
+      entityId: String(g.id),
+      detail: g.title,
+      tokensUsed: 0,
+      cost: 0,
+    });
     res.json(g);
   });
 
   // ─── Audit Log ────────────────────────────────────────────────────────────
-  app.get("/api/tenants/:tenantId/audit", (req, res) =>
-    res.json(storage.getAuditLog(Number(req.params.tenantId)))
-  );
+  app.get("/api/tenants/:tenantId/audit", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    if (!storage.getTenant(tenantId)) throw new ApiError(404, "not_found", "Tenant not found");
+    res.json(storage.getAuditLog(tenantId));
+  });
 
   // ─── Clear Demo Data ───────────────────────────────────────────────────────
   app.delete("/api/tenants/:tenantId/demo-data", (req, res) => {
     const tenantId = Number(req.params.tenantId);
     const tenant = storage.getTenant(tenantId);
-    if (!tenant) return res.status(404).json({ error: "Tenant not found" });
+    if (!tenant) throw new ApiError(404, "not_found", "Tenant not found");
     storage.clearDemoData(tenantId);
+    auditAndInvalidate(tenantId, ["agents", "tasks", "goals", "messages", "teams", "audit"], {
+      action: "demo_data_cleared",
+      entity: "tenant",
+      entityId: String(tenantId),
+      detail: "Cleared demo data",
+      tokensUsed: 0,
+      cost: 0,
+    });
+    invalidateTenant(tenantId, ["agents", "tasks", "goals", "messages", "teams", "audit", "tenant"]);
     res.json({ ok: true, message: "Demo data cleared" });
   });
 

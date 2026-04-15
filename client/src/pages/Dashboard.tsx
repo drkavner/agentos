@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
 import type { Agent, Task, Goal, Tenant, Message } from "@shared/schema";
-import { ACTIVE_TENANT_ID } from "@/components/AppShell";
+import { useTenantContext } from "@/tenant/TenantContext";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
@@ -39,7 +39,8 @@ function AgentStatusDot({ status }: { status: string }) {
 }
 
 export default function Dashboard() {
-  const tid = ACTIVE_TENANT_ID;
+  const { activeTenantId } = useTenantContext();
+  const tid = activeTenantId ?? 0;
 
   const { data: tenant } = useQuery<Tenant>({
     queryKey: ["/api/tenants", tid],

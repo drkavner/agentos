@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import type { Tenant } from "@shared/schema";
+import { TENANT_ADAPTER_LABELS, type TenantAdapterType } from "@shared/schema";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -9,11 +10,23 @@ import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Form, FormControl, FormField, FormItem, FormLabel } from "@/components/ui/form";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { AdapterPickerCards } from "@/components/AdapterPickerCards";
 import { Progress } from "@/components/ui/progress";
 import { Plus, Building2, Trash2, ExternalLink } from "lucide-react";
 import { useForm } from "react-hook-form";
 import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
+import { useTenantContext } from "@/tenant/TenantContext";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter as AlertFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 
 const STATUS_COLORS: Record<string, string> = {
   active: "bg-green-500/10 text-green-400 border-green-500/20",
@@ -30,7 +43,18 @@ const PLAN_COLORS: Record<string, string> = {
 export default function Tenants() {
   const { toast } = useToast();
   const [showCreate, setShowCreate] = useState(false);
-  const form = useForm({ defaultValues: { name: "", slug: "", plan: "starter", monthlyBudget: 500, mission: "" } });
+  const [deleteId, setDeleteId] = useState<number | null>(null);
+  const { activeTenantId, setActiveTenantId } = useTenantContext();
+  const form = useForm({
+    defaultValues: {
+      name: "",
+      slug: "",
+      plan: "starter",
+      monthlyBudget: 500,
+      mission: "",
+      adapterType: "hermes" as TenantAdapterType,
+    },
+  });
 
   const { data: tenants = [] } = useQuery<Tenant[]>({
     queryKey: ["/api/tenants"],
@@ -38,10 +62,15 @@ export default function Tenants() {
   });
 
   const createTenant = useMutation({
-    mutationFn: (data: any) => apiRequest("POST", "/api/tenants", data).then(r => r.json()),
-    onSuccess: () => {
+    mutationFn: (data: any) => apiRequest("POST", "/api/tenants", data).then((r) => r.json() as Promise<Tenant>),
+    onSuccess: (t) => {
       queryClient.invalidateQueries({ queryKey: ["/api/tenants"] });
-      toast({ title: "Organization created" });
+      if (t?.id != null) {
+        queryClient.invalidateQueries({ queryKey: ["/api/tenants", t.id, "agents"] });
+        queryClient.invalidateQueries({ queryKey: ["/api/tenants", t.id, "ceo", "control"] });
+        setActiveTenantId(t.id);
+      }
+      toast({ title: "Organization created", description: "A CEO agent was added automatically." });
       setShowCreate(false);
       form.reset();
     },
@@ -49,9 +78,21 @@ export default function Tenants() {
 
   const deleteTenant = useMutation({
     mutationFn: (id: number) => apiRequest("DELETE", `/api/tenants/${id}`),
-    onSuccess: () => {
+    onSuccess: (_res, id) => {
       queryClient.invalidateQueries({ queryKey: ["/api/tenants"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/tenants", id] });
+      queryClient.invalidateQueries({ queryKey: ["/api/tenants", id, "agents"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/tenants", id, "teams"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/tenants", id, "tasks"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/tenants", id, "goals"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/tenants", id, "messages"] });
       toast({ title: "Organization deleted" });
+
+      // If we deleted the active tenant, pick another (provider will also self-heal on next fetch).
+      if (activeTenantId === id) {
+        const remaining = tenants.filter((t) => t.id !== id);
+        if (remaining.length > 0) setActiveTenantId(remaining[0]!.id);
+      }
     },
   });
 
@@ -107,6 +148,9 @@ export default function Tenants() {
                     <Badge variant="outline" className={cn("text-xs py-0 capitalize", PLAN_COLORS[tenant.plan])}>
                       {tenant.plan}
                     </Badge>
+                    <Badge variant="outline" className="text-xs py-0 text-muted-foreground">
+                      {(tenant.adapterType === "openclaw" ? TENANT_ADAPTER_LABELS.openclaw : TENANT_ADAPTER_LABELS.hermes)}
+                    </Badge>
                   </div>
                 </div>
 
@@ -130,7 +174,7 @@ export default function Tenants() {
                     size="sm"
                     variant="outline"
                     className="text-destructive hover:bg-destructive/10 border-destructive/30"
-                    onClick={() => deleteTenant.mutate(tenant.id)}
+                    onClick={() => setDeleteId(tenant.id)}
                     disabled={tenants.length <= 1}
                     data-testid={`delete-tenant-${tenant.id}`}
                   >
@@ -145,7 +189,7 @@ export default function Tenants() {
 
       {/* Create dialog */}
       <Dialog open={showCreate} onOpenChange={setShowCreate}>
-        <DialogContent className="max-w-md">
+        <DialogContent className="max-w-lg">
           <DialogHeader>
             <DialogTitle>Create Organization</DialogTitle>
           </DialogHeader>
@@ -166,7 +210,7 @@ export default function Tenants() {
               <FormField control={form.control} name="plan" render={({ field }) => (
                 <FormItem>
                   <FormLabel>Plan</FormLabel>
-                  <Select onValueChange={field.onChange} defaultValue={field.value}>
+                  <Select onValueChange={field.onChange} value={field.value}>
                     <FormControl><SelectTrigger><SelectValue /></SelectTrigger></FormControl>
                     <SelectContent>
                       <SelectItem value="starter">Starter</SelectItem>
@@ -174,6 +218,21 @@ export default function Tenants() {
                       <SelectItem value="enterprise">Enterprise</SelectItem>
                     </SelectContent>
                   </Select>
+                </FormItem>
+              )} />
+              <FormField control={form.control} name="adapterType" render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Agent adapter</FormLabel>
+                  <FormControl>
+                    <div className="w-full pt-0.5">
+                      <AdapterPickerCards
+                        value={field.value}
+                        onChange={field.onChange}
+                        data-testid="org-adapter-create"
+                        helperText="All agents hired from the Agent Library for this organization run through the selected adapter."
+                      />
+                    </div>
+                  </FormControl>
                 </FormItem>
               )} />
               <FormField control={form.control} name="monthlyBudget" render={({ field }) => (
@@ -198,6 +257,29 @@ export default function Tenants() {
           </Form>
         </DialogContent>
       </Dialog>
+
+      <AlertDialog open={deleteId !== null} onOpenChange={(v) => !v && setDeleteId(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete organization?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This will permanently delete the organization and all related agents, tasks, messages, goals, teams, and audit logs.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertFooter>
+            <AlertDialogCancel onClick={() => setDeleteId(null)}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              onClick={() => {
+                if (deleteId !== null) deleteTenant.mutate(deleteId);
+                setDeleteId(null);
+              }}
+            >
+              Delete
+            </AlertDialogAction>
+          </AlertFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

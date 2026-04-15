@@ -4,12 +4,10 @@ import {
   LayoutDashboard, Bot, Users, Network, CheckSquare,
   MessageSquare, Settings, Building2, ScrollText,
   ChevronDown, ChevronRight, Zap, Moon, Sun, Menu, X,
-  Bell, Search
+  Bell, Search, Crown
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { useQuery } from "@tanstack/react-query";
-import { apiRequest } from "@/lib/queryClient";
-import type { Tenant } from "@shared/schema";
+import { useTenantContext } from "@/tenant/TenantContext";
 import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import {
@@ -28,6 +26,7 @@ const NAV = [
       { href: "/", icon: LayoutDashboard, label: "Dashboard" },
     ],
   },
+  
   {
     label: "Agents",
     items: [
@@ -42,6 +41,7 @@ const NAV = [
       { href: "/tasks", icon: CheckSquare, label: "Tasks" },
       { href: "/collab", icon: MessageSquare, label: "Collaboration" },
       { href: "/audit", icon: ScrollText, label: "Audit Log" },
+      { href: "/ceo/dashboard", icon: Crown, label: "CEO" },
     ],
   },
   {
@@ -55,23 +55,13 @@ const NAV = [
 
 interface AppShellProps { children: React.ReactNode; }
 
-// Global tenant context
-export let ACTIVE_TENANT_ID = 1;
-export function setActiveTenantId(id: number) { ACTIVE_TENANT_ID = id; }
-
 export function AppShell({ children }: AppShellProps) {
   const [location] = useLocation();
   const [dark, setDark] = useState(true);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
 
-  const { data: tenants } = useQuery<Tenant[]>({
-    queryKey: ["/api/tenants"],
-    queryFn: () => apiRequest("GET", "/api/tenants").then(r => r.json()),
-  });
-
-  const [activeTenantId, setActiveTenantIdState] = useState(1);
-  const activeTenant = tenants?.find(t => t.id === activeTenantId);
+  const { tenants, activeTenantId, setActiveTenantId, activeTenant } = useTenantContext();
 
   useEffect(() => {
     document.documentElement.classList.toggle("light", !dark);
@@ -93,7 +83,7 @@ export function AppShell({ children }: AppShellProps) {
         </div>
         {sidebarOpen && (
           <div>
-            <div className="text-sm font-semibold text-sidebar-foreground tracking-wide">AgentOS</div>
+            <div className="text-sm font-semibold text-sidebar-foreground tracking-wide">Cortex</div>
             <div className="text-xs text-muted-foreground">Multi-Agent Platform</div>
           </div>
         )}
@@ -122,7 +112,7 @@ export function AppShell({ children }: AppShellProps) {
               <DropdownMenuLabel>Switch Organization</DropdownMenuLabel>
               <DropdownMenuSeparator />
               {tenants?.map(t => (
-                <DropdownMenuItem key={t.id} onClick={() => { setActiveTenantIdState(t.id); ACTIVE_TENANT_ID = t.id; }}>
+                <DropdownMenuItem key={t.id} onClick={() => setActiveTenantId(t.id)}>
                   <span className="mr-2">{t.name}</span>
                   <Badge variant="outline" className="ml-auto text-xs">{t.plan}</Badge>
                 </DropdownMenuItem>
@@ -147,18 +137,21 @@ export function AppShell({ children }: AppShellProps) {
                 const active = location === item.href || (item.href !== "/" && location.startsWith(item.href));
                 return (
                   <li key={item.href}>
-                    <Link href={item.href}>
-                      <a onClick={() => setMobileSidebarOpen(false)} className={cn(
+                    <Link
+                      href={item.href}
+                      onClick={() => setMobileSidebarOpen(false)}
+                      className={cn(
                         "flex items-center gap-3 px-2 py-2 rounded-md text-sm transition-all",
                         sidebarOpen ? "" : "justify-center",
                         active
                           ? "bg-primary/15 text-primary font-medium"
-                          : "text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
-                      )} data-testid={`nav-${item.label.toLowerCase().replace(/\s+/g, '-')}`}>
-                        <Icon className={cn("flex-shrink-0", sidebarOpen ? "w-4 h-4" : "w-5 h-5")} />
-                        {sidebarOpen && <span>{item.label}</span>}
-                        {active && sidebarOpen && <div className="ml-auto w-1.5 h-1.5 rounded-full bg-primary" />}
-                      </a>
+                          : "text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+                      )}
+                      data-testid={`nav-${item.label.toLowerCase().replace(/\s+/g, "-")}`}
+                    >
+                      <Icon className={cn("flex-shrink-0", sidebarOpen ? "w-4 h-4" : "w-5 h-5")} />
+                      {sidebarOpen && <span>{item.label}</span>}
+                      {active && sidebarOpen && <div className="ml-auto w-1.5 h-1.5 rounded-full bg-primary" />}
                     </Link>
                   </li>
                 );
@@ -236,15 +229,10 @@ export function AppShell({ children }: AppShellProps) {
         </header>
 
         {/* Page content */}
-        <main className="flex-1 overflow-y-auto" data-active-tenant={activeTenantId}>
+        <main className="flex-1 overflow-y-auto" data-active-tenant={activeTenantId ?? ""}>
           {children}
         </main>
       </div>
     </div>
   );
-}
-
-// Hook to read active tenant from shell
-export function useActiveTenantId() {
-  return ACTIVE_TENANT_ID;
 }

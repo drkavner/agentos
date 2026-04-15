@@ -1,0 +1,1 @@
+ALTER TABLE `tenants` ADD `adapter_type` text DEFAULT 'hermes' NOT NULL;

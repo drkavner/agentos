@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
-import type { Agent } from "@shared/schema";
-import { ACTIVE_TENANT_ID } from "@/components/AppShell";
+import type { AuditLog as AuditLogRow } from "@shared/schema";
+import { useTenantContext } from "@/tenant/TenantContext";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { ScrollText, Bot, DollarSign } from "lucide-react";
@@ -11,67 +11,51 @@ function formatTime(dateStr: string) {
   return new Date(dateStr).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 }
 
-// Simulated audit events since seeding creates them dynamically
-function generateAuditEvents(agents: Agent[]) {
-  const actions = [
-    { action: "heartbeat", entity: "agent", color: "text-accent" },
-    { action: "task_checkout", entity: "task", color: "text-primary" },
-    { action: "message_sent", entity: "message", color: "text-muted-foreground" },
-    { action: "task_completed", entity: "task", color: "text-green-400" },
-    { action: "budget_check", entity: "budget", color: "text-yellow-400" },
-    { action: "decision_made", entity: "decision", color: "text-primary" },
-    { action: "tool_called", entity: "tool", color: "text-blue-400" },
-    { action: "status_changed", entity: "agent", color: "text-orange-400" },
-  ];
-  const events = [];
-  const now = Date.now();
-  for (let i = 0; i < 40; i++) {
-    const agent = agents[Math.floor(Math.random() * agents.length)];
-    const action = actions[Math.floor(Math.random() * actions.length)];
-    if (!agent) continue;
-    events.push({
-      id: i,
-      agentName: agent.displayName,
-      agentEmoji: "🤖",
-      action: action.action,
-      entity: action.entity,
-      entityId: `${action.entity}-${Math.floor(Math.random() * 100)}`,
-      color: action.color,
-      tokensUsed: Math.floor(Math.random() * 2000),
-      cost: Math.random() * 0.05,
-      createdAt: new Date(now - i * 12 * 60000).toISOString(),
-      detail: {
-        heartbeat: "Woke up, checked work queue, no pending tasks",
-        task_checkout: "Checked out task atomically, setting status to in_progress",
-        message_sent: "Sent message to general channel",
-        task_completed: "Marked task as done, logged 847 tokens consumed",
-        budget_check: "Verified monthly budget — within limits",
-        decision_made: "Escalated budget approval request to CEO",
-        tool_called: "Called web_search tool with query: 'AI agent orchestration 2025'",
-        status_changed: "Changed status from idle to running",
-      }[action.action],
-    });
-  }
-  return events;
+const ACTION_COLORS: Record<string, string> = {
+  heartbeat: "text-accent",
+  task_checkout: "text-primary",
+  message_sent: "text-muted-foreground",
+  task_completed: "text-green-400",
+  task_created: "text-primary",
+  task_deleted: "text-orange-400",
+  budget_check: "text-yellow-400",
+  decision_made: "text-primary",
+  tool_called: "text-blue-400",
+  status_changed: "text-orange-400",
+  agent_hired: "text-green-400",
+  agent_updated: "text-orange-400",
+  agent_deleted: "text-destructive",
+  team_created: "text-primary",
+  team_updated: "text-muted-foreground",
+  team_deleted: "text-destructive",
+  team_member_added: "text-primary",
+  team_member_removed: "text-muted-foreground",
+  goal_created: "text-primary",
+  goal_updated: "text-muted-foreground",
+};
+
+function actionColor(action: string) {
+  return ACTION_COLORS[action] ?? "text-muted-foreground";
 }
 
 export default function AuditLog() {
-  const tid = ACTIVE_TENANT_ID;
+  const { activeTenantId } = useTenantContext();
+  const tid = activeTenantId ?? 0;
 
-  const { data: agents = [] } = useQuery<Agent[]>({
-    queryKey: ["/api/tenants", tid, "agents"],
-    queryFn: () => apiRequest("GET", `/api/tenants/${tid}/agents`).then(r => r.json()),
+  const { data: events = [], isLoading } = useQuery<AuditLogRow[]>({
+    queryKey: ["/api/tenants", tid, "audit"],
+    queryFn: () => apiRequest("GET", `/api/tenants/${tid}/audit`).then((r) => r.json()),
+    enabled: tid > 0,
   });
 
-  const events = generateAuditEvents(agents);
-  const totalTokens = events.reduce((s, e) => s + e.tokensUsed, 0);
-  const totalCost = events.reduce((s, e) => s + e.cost, 0);
+  const totalTokens = events.reduce((s, e) => s + (e.tokensUsed ?? 0), 0);
+  const totalCost = events.reduce((s, e) => s + (e.cost ?? 0), 0);
 
   return (
     <div className="p-6 space-y-5 max-w-[1400px] mx-auto">
       <div>
         <h1 className="text-xl font-bold text-foreground">Audit Log</h1>
-        <p className="text-sm text-muted-foreground mt-0.5">Immutable trace of every agent action, decision, and tool call</p>
+        <p className="text-sm text-muted-foreground mt-0.5">Immutable trace of actions recorded by the control plane (from the database)</p>
       </div>
 
       {/* Stats */}
@@ -81,7 +65,7 @@ export default function AuditLog() {
             <ScrollText className="w-5 h-5 text-primary" />
             <div>
               <p className="text-xs text-muted-foreground">Total Events</p>
-              <p className="text-xl font-bold text-foreground">{events.length}</p>
+              <p className="text-xl font-bold text-foreground">{isLoading ? "…" : events.length}</p>
             </div>
           </CardContent>
         </Card>
@@ -90,7 +74,7 @@ export default function AuditLog() {
             <Bot className="w-5 h-5 text-accent" />
             <div>
               <p className="text-xs text-muted-foreground">Tokens Used</p>
-              <p className="text-xl font-bold text-foreground">{totalTokens.toLocaleString()}</p>
+              <p className="text-xl font-bold text-foreground">{isLoading ? "…" : totalTokens.toLocaleString()}</p>
             </div>
           </CardContent>
         </Card>
@@ -99,7 +83,7 @@ export default function AuditLog() {
             <DollarSign className="w-5 h-5 text-yellow-400" />
             <div>
               <p className="text-xs text-muted-foreground">Total Cost</p>
-              <p className="text-xl font-bold text-foreground">${totalCost.toFixed(3)}</p>
+              <p className="text-xl font-bold text-foreground">{isLoading ? "…" : `$${totalCost.toFixed(3)}`}</p>
             </div>
           </CardContent>
         </Card>
@@ -127,26 +111,46 @@ export default function AuditLog() {
                 </tr>
               </thead>
               <tbody>
-                {events.map(e => (
-                  <tr key={e.id} className="border-b border-border last:border-0 hover:bg-muted/20 transition-colors" data-testid={`audit-row-${e.id}`}>
-                    <td className="px-4 py-2.5 text-muted-foreground font-mono whitespace-nowrap">{formatTime(e.createdAt)}</td>
-                    <td className="px-4 py-2.5">
-                      <div className="flex items-center gap-1.5">
-                        <span>🤖</span>
-                        <span className="font-medium text-foreground">{e.agentName}</span>
-                      </div>
+                {isLoading ? (
+                  <tr>
+                    <td colSpan={7} className="px-4 py-8 text-center text-muted-foreground">
+                      Loading audit log…
                     </td>
-                    <td className="px-4 py-2.5">
-                      <Badge variant="outline" className={cn("text-xs py-0 font-mono", e.color)}>
-                        {e.action}
-                      </Badge>
-                    </td>
-                    <td className="px-4 py-2.5 text-muted-foreground">{e.entity}</td>
-                    <td className="px-4 py-2.5 text-muted-foreground max-w-xs truncate">{e.detail}</td>
-                    <td className="px-4 py-2.5 text-right font-mono text-muted-foreground">{e.tokensUsed.toLocaleString()}</td>
-                    <td className="px-4 py-2.5 text-right font-mono text-yellow-400">${e.cost.toFixed(4)}</td>
                   </tr>
-                ))}
+                ) : events.length === 0 ? (
+                  <tr>
+                    <td colSpan={7} className="px-4 py-8 text-center text-muted-foreground">
+                      No audit events yet. Actions you take in the app (tasks, agents, messages, etc.) are logged here.
+                    </td>
+                  </tr>
+                ) : (
+                  events.map((e) => (
+                    <tr
+                      key={e.id}
+                      className="border-b border-border last:border-0 hover:bg-muted/20 transition-colors"
+                      data-testid={`audit-row-${e.id}`}
+                    >
+                      <td className="px-4 py-2.5 text-muted-foreground font-mono whitespace-nowrap">{formatTime(e.createdAt)}</td>
+                      <td className="px-4 py-2.5">
+                        <div className="flex items-center gap-1.5">
+                          <span>🤖</span>
+                          <span className="font-medium text-foreground">{e.agentName ?? "—"}</span>
+                        </div>
+                      </td>
+                      <td className="px-4 py-2.5">
+                        <Badge variant="outline" className={cn("text-xs py-0 font-mono", actionColor(e.action))}>
+                          {e.action}
+                        </Badge>
+                      </td>
+                      <td className="px-4 py-2.5 text-muted-foreground">{e.entity}</td>
+                      <td className="px-4 py-2.5 text-muted-foreground max-w-xs truncate" title={e.detail ?? ""}>
+                        {e.detail ?? "—"}
+                      </td>
+                      <td className="px-4 py-2.5 text-right font-mono text-muted-foreground">{(e.tokensUsed ?? 0).toLocaleString()}</td>
+                      <td className="px-4 py-2.5 text-right font-mono text-yellow-400">${(e.cost ?? 0).toFixed(4)}</td>
+                    </tr>
+                  ))
+                )}
               </tbody>
             </table>
           </div>

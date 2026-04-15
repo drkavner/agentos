@@ -1,8 +1,9 @@
 import { useState } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
-import { apiRequest, queryClient } from "@/lib/queryClient";
+import { apiRequest, queryClient, readJsonOrApiHint } from "@/lib/queryClient";
 import type { Tenant } from "@shared/schema";
-import { ACTIVE_TENANT_ID } from "@/components/AppShell";
+import type { TenantAdapterType } from "@shared/schema";
+import { useTenantContext } from "@/tenant/TenantContext";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -11,6 +12,7 @@ import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { useForm } from "react-hook-form";
 import { Form, FormControl, FormField, FormItem, FormLabel } from "@/components/ui/form";
+import { AdapterPickerCards } from "@/components/AdapterPickerCards";
 import { useToast } from "@/hooks/use-toast";
 import { Building2, DollarSign, Key, Shield, Trash2, AlertTriangle } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -20,7 +22,8 @@ import {
 } from "@/components/ui/alert-dialog";
 
 export default function Settings() {
-  const tid = ACTIVE_TENANT_ID;
+  const { activeTenantId } = useTenantContext();
+  const tid = activeTenantId ?? 0;
   const { toast } = useToast();
   const [clearConfirmOpen, setClearConfirmOpen] = useState(false);
 
@@ -44,6 +47,27 @@ export default function Settings() {
       mission: tenant?.mission ?? "",
       monthlyBudget: tenant?.monthlyBudget ?? 500,
       maxAgents: tenant?.maxAgents ?? 25,
+      adapterType: (tenant?.adapterType === "openclaw" ? "openclaw" : "hermes") as TenantAdapterType,
+      ollamaBaseUrl: tenant?.ollamaBaseUrl ?? "",
+    },
+  });
+
+  const listOllamaModels = useMutation({
+    mutationFn: async () => {
+      const url = String(form.getValues("ollamaBaseUrl") ?? "").trim();
+      const q = url ? `?${new URLSearchParams({ url }).toString()}` : "";
+      const r = await apiRequest("GET", `/api/tenants/${tid}/ollama/models${q}`);
+      return readJsonOrApiHint<{ baseUsed: string; models: string[] }>(r);
+    },
+    onSuccess: () => {
+      toast({ title: "Ollama", description: "Model list updated." });
+    },
+    onError: (e: any) => {
+      toast({
+        title: "Could not reach Ollama",
+        description: String(e?.message ?? "Check the base URL and that Ollama is running."),
+        variant: "destructive",
+      });
     },
   });
 
@@ -115,6 +139,74 @@ export default function Settings() {
               <p className="text-xs text-muted-foreground -mt-1">
                 Currently <strong>{tenant?.maxAgents ?? 25}</strong> agents allowed. The system will block new hires once this cap is reached.
               </p>
+              <FormField control={form.control} name="adapterType" render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Agent adapter</FormLabel>
+                  <FormControl>
+                    <div className="w-full pt-0.5">
+                      <AdapterPickerCards
+                        value={field.value}
+                        onChange={field.onChange}
+                        data-testid="settings-adapter"
+                        helperText="All Agent Library hires for this organization use this execution plane."
+                      />
+                    </div>
+                  </FormControl>
+                </FormItem>
+              )} />
+              <FormField
+                control={form.control}
+                name="ollamaBaseUrl"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Ollama base URL</FormLabel>
+                    <FormControl>
+                      <Input
+                        {...field}
+                        placeholder="http://127.0.0.1:11434"
+                        className="font-mono text-xs"
+                        data-testid="ollama-base-url-input"
+                      />
+                    </FormControl>
+                    <p className="text-[11px] text-muted-foreground">
+                      Host only (per{" "}
+                      <a className="underline hover:text-foreground" href="https://docs.ollama.com/api/introduction" target="_blank" rel="noreferrer">
+                        Ollama API docs
+                      </a>
+                      ), e.g. <span className="font-mono">http://127.0.0.1:11434</span> — not the full <span className="font-mono">…/api</span> path. Leave empty to use{" "}
+                      <span className="font-mono">OLLAMA_BASE_URL</span>.
+                    </p>
+                    <div className="flex flex-wrap items-center gap-2 pt-1">
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        size="sm"
+                        disabled={listOllamaModels.isPending || tid <= 0}
+                        onClick={() => listOllamaModels.mutate()}
+                        data-testid="ollama-detect-models"
+                      >
+                        {listOllamaModels.isPending ? "Checking…" : "Detect models"}
+                      </Button>
+                      {listOllamaModels.isSuccess && listOllamaModels.data ? (
+                        <span className="text-xs text-muted-foreground">
+                          <span className="font-mono text-foreground">{listOllamaModels.data.baseUsed}</span>
+                          {" · "}
+                          {listOllamaModels.data.models.length} model(s)
+                        </span>
+                      ) : null}
+                    </div>
+                    {listOllamaModels.isSuccess && listOllamaModels.data?.models?.length ? (
+                      <ul className="mt-2 max-h-36 overflow-y-auto rounded-md border border-border bg-muted/20 p-2 text-[11px] font-mono space-y-0.5">
+                        {listOllamaModels.data.models.map((m) => (
+                          <li key={m}>{m}</li>
+                        ))}
+                      </ul>
+                    ) : listOllamaModels.isSuccess && !listOllamaModels.data?.models?.length ? (
+                      <p className="text-xs text-amber-600/90 mt-2">No models reported — run: ollama pull &lt;model&gt;</p>
+                    ) : null}
+                  </FormItem>
+                )}
+              />
               <Button type="submit" disabled={updateTenant.isPending} data-testid="save-settings-btn">
                 {updateTenant.isPending ? "Saving..." : "Save Changes"}
               </Button>
@@ -161,18 +253,22 @@ export default function Settings() {
           <CardTitle className="text-sm font-semibold flex items-center gap-2">
             <Key className="w-4 h-4 text-accent" /> API Keys
           </CardTitle>
-          <CardDescription className="text-xs">Configure LLM provider API keys for your agents</CardDescription>
+          <CardDescription className="text-xs">
+            OpenRouter key is set on the server via <span className="font-mono">OPENROUTER_API_KEY</span>. Ollama URL is saved under Organization above.
+          </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
           {[
-            { label: "Anthropic API Key", placeholder: "sk-ant-..." },
-            { label: "OpenAI API Key", placeholder: "sk-..." },
-            { label: "Google AI API Key", placeholder: "AIza..." },
-            { label: "OpenRouter API Key", placeholder: "sk-or-..." },
-          ].map(k => (
+            { label: "OpenRouter API Key", placeholder: "sk-or-v1-...", testId: "openrouter", password: true as const },
+          ].map((k) => (
             <div key={k.label}>
               <Label className="text-xs">{k.label}</Label>
-              <Input type="password" placeholder={k.placeholder} className="mt-1 font-mono text-xs" data-testid={`api-key-${k.label.split(" ")[0].toLowerCase()}`} />
+              <Input
+                type={k.password ? "password" : "text"}
+                placeholder={k.placeholder}
+                className="mt-1 font-mono text-xs"
+                data-testid={`api-key-${k.testId}`}
+              />
             </div>
           ))}
           <Button variant="outline" size="sm" className="mt-2">Save API Keys</Button>

@@ -1,6 +1,6 @@
-import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { apiRequest } from "@/lib/queryClient";
+import { useEffect, useState } from "react";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { apiRequest, queryClient } from "@/lib/queryClient";
 import type { AgentDefinition } from "@shared/schema";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -12,10 +12,16 @@ import {
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { HireAgentWizard } from "@/components/HireAgentWizard";
+import { useTenantContext } from "@/tenant/TenantContext";
+import { Textarea } from "@/components/ui/textarea";
+import { useToast } from "@/hooks/use-toast";
 
 const DIVISIONS = ["All", "Engineering", "Design", "Marketing", "Marketing Ops", "Sales", "Product", "Finance", "Support", "Specialized"];
 
 export default function AgentLibrary() {
+  const { activeTenantId } = useTenantContext();
+  const tid = activeTenantId ?? 0;
+  const { toast } = useToast();
   const [search, setSearch] = useState("");
   const [division, setDivision] = useState("All");
 
@@ -28,6 +34,34 @@ export default function AgentLibrary() {
   const { data: defs = [] } = useQuery<AgentDefinition[]>({
     queryKey: ["/api/agent-definitions"],
     queryFn: () => apiRequest("GET", "/api/agent-definitions").then(r => r.json()),
+  });
+
+  const { data: skillsMd, isLoading: isLoadingSkills } = useQuery<{ markdown: string; source?: string; updatedAt?: string }>({
+    queryKey: ["/api/agent-definitions", selected?.id, "skills", tid],
+    queryFn: () => apiRequest("GET", `/api/agent-definitions/${selected!.id}/skills?tenantId=${tid}`).then(r => r.json()),
+    enabled: !!selected?.id && tid > 0,
+  });
+
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+
+  useEffect(() => {
+    if (!selected) return;
+    setEditing(false);
+    setDraft(skillsMd?.markdown ?? "");
+  }, [selected?.id, skillsMd?.markdown]);
+
+  const saveSkills = useMutation({
+    mutationFn: (markdown: string) =>
+      apiRequest("PUT", `/api/tenants/${tid}/agent-definitions/${selected!.id}/skills`, { markdown }).then(r => r.json()),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["/api/agent-definitions", selected?.id, "skills", tid] });
+      toast({ title: "Saved", description: "skills.md updated for this organization." });
+      setEditing(false);
+    },
+    onError: (err: Error) => {
+      toast({ title: "Save failed", description: err.message || "Try again.", variant: "destructive" });
+    },
   });
 
   const filtered = defs.filter(d => {
@@ -163,6 +197,50 @@ export default function AgentLibrary() {
               <div>
                 <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">When to Use</h4>
                 <p className="text-sm text-foreground">{selected.whenToUse}</p>
+              </div>
+              <div>
+                <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">Skills</h4>
+                {isLoadingSkills ? (
+                  <p className="text-sm text-muted-foreground">Loading skills…</p>
+                ) : (
+                  <div className="space-y-2">
+                    {!editing ? (
+                      <pre className="text-xs text-foreground whitespace-pre-wrap rounded-md border border-border bg-muted/30 p-3 max-h-64 overflow-auto">
+                        {skillsMd?.markdown ?? "No skills.md available yet."}
+                      </pre>
+                    ) : (
+                      <Textarea
+                        value={draft}
+                        onChange={(e) => setDraft(e.target.value)}
+                        className="min-h-[220px] font-mono text-xs"
+                        data-testid="skills-editor"
+                      />
+                    )}
+
+                    <div className="flex items-center justify-between">
+                      <div className="text-xs text-muted-foreground">
+                        {skillsMd?.source === "override" ? "Org override" : skillsMd?.source === "file" ? "Default file" : "Generated"}
+                        {skillsMd?.updatedAt ? ` · updated ${new Date(skillsMd.updatedAt).toLocaleString()}` : ""}
+                      </div>
+                      <div className="flex gap-2">
+                        {!editing ? (
+                          <Button size="sm" variant="outline" onClick={() => setEditing(true)} data-testid="skills-edit">
+                            Edit
+                          </Button>
+                        ) : (
+                          <>
+                            <Button size="sm" variant="outline" onClick={() => { setEditing(false); setDraft(skillsMd?.markdown ?? ""); }}>
+                              Cancel
+                            </Button>
+                            <Button size="sm" onClick={() => saveSkills.mutate(draft)} disabled={saveSkills.isPending || !draft.trim()} data-testid="skills-save">
+                              {saveSkills.isPending ? "Saving…" : "Save"}
+                            </Button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
 
             </div>

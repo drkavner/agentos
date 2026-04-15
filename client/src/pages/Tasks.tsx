@@ -1,8 +1,8 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import type { Task, Agent, Team } from "@shared/schema";
-import { ACTIVE_TENANT_ID } from "@/components/AppShell";
+import { useTenantContext } from "@/tenant/TenantContext";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -16,6 +16,17 @@ import { cn } from "@/lib/utils";
 import { useToast } from "@/hooks/use-toast";
 import { useForm } from "react-hook-form";
 import { Form, FormControl, FormField, FormItem, FormLabel } from "@/components/ui/form";
+import {
+  DndContext,
+  DragOverlay,
+  PointerSensor,
+  closestCorners,
+  useDroppable,
+  useSensor,
+  useSensors,
+} from "@dnd-kit/core";
+import { CSS } from "@dnd-kit/utilities";
+import { useSortable, SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
 
 const STATUSES = ["todo", "in_progress", "review", "done", "blocked"] as const;
 type Status = typeof STATUSES[number];
@@ -40,17 +51,32 @@ interface TaskCardProps {
   agents: Agent[];
   onStatusChange: (id: number, status: string) => void;
   onDelete: (id: number) => void;
+  dragAttributes?: Record<string, any>;
+  dragListeners?: Record<string, any>;
+  dragRef?: (node: HTMLElement | null) => void;
+  dragStyle?: React.CSSProperties;
 }
 
-function TaskCard({ task, agents, onStatusChange, onDelete }: TaskCardProps) {
+function TaskCard({ task, agents, onStatusChange, onDelete, dragAttributes, dragListeners, dragRef, dragStyle }: TaskCardProps) {
   const agent = agents.find(a => a.id === task.assignedAgentId);
   const s = STATUS_CONFIG[task.status as Status];
   return (
-    <div className={cn("group border border-border rounded-lg p-3 cursor-pointer hover:border-primary/40 transition-all bg-card", s.bg)} data-testid={`task-${task.id}`}>
+    <div
+      ref={dragRef}
+      style={dragStyle}
+      {...dragAttributes}
+      {...dragListeners}
+      className={cn(
+        "group border border-border rounded-lg p-3 cursor-grab active:cursor-grabbing hover:border-primary/40 transition-all bg-card",
+        "touch-none select-none",
+        s.bg,
+      )}
+      data-testid={`task-${task.id}`}
+    >
       <div className="flex items-start justify-between gap-2 mb-2">
         <p className="text-xs font-medium text-foreground leading-tight">{task.title}</p>
         <button
-          onClick={() => onDelete(task.id)}
+          onClick={(e) => { e.stopPropagation(); onDelete(task.id); }}
           className="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-destructive transition-all"
           data-testid={`delete-task-${task.id}`}
         >
@@ -97,8 +123,97 @@ function TaskCard({ task, agents, onStatusChange, onDelete }: TaskCardProps) {
   );
 }
 
+function SortableTaskCard({
+  task,
+  agents,
+  onStatusChange,
+  onDelete,
+}: TaskCardProps) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: `task:${task.id}`,
+    data: { type: "task", taskId: task.id },
+  });
+  const style: React.CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.4 : undefined,
+  };
+  return (
+    <TaskCard
+      task={task}
+      agents={agents}
+      onStatusChange={onStatusChange}
+      onDelete={onDelete}
+      dragAttributes={attributes}
+      dragListeners={listeners}
+      dragRef={setNodeRef}
+      dragStyle={style}
+    />
+  );
+}
+
+function KanbanColumn({
+  status,
+  label,
+  icon: Icon,
+  color,
+  tasks,
+  agents,
+  onStatusChange,
+  onDelete,
+}: {
+  status: Status;
+  label: string;
+  icon: any;
+  color: string;
+  tasks: Task[];
+  agents: Agent[];
+  onStatusChange: (id: number, status: string) => void;
+  onDelete: (id: number) => void;
+}) {
+  const { setNodeRef, isOver } = useDroppable({ id: `col:${status}`, data: { type: "column", status } });
+  return (
+    <div key={status} className="flex flex-col gap-3 kanban-col">
+      <div className="flex items-center gap-2 px-1">
+        <Icon className={cn("w-3.5 h-3.5", color)} />
+        <span className="text-xs font-semibold text-muted-foreground">{label}</span>
+        <span className="ml-auto text-xs text-muted-foreground bg-muted rounded-full px-1.5">{tasks.length}</span>
+      </div>
+
+      <div
+        ref={setNodeRef}
+        className={cn(
+          "space-y-2 rounded-lg p-1 transition-colors",
+          isOver ? "bg-primary/5" : "bg-transparent",
+        )}
+      >
+        <SortableContext items={tasks.map((t) => `task:${t.id}`)} strategy={verticalListSortingStrategy}>
+          {tasks.map((t) => (
+            <SortableTaskCard
+              key={t.id}
+              task={t}
+              agents={agents}
+              onStatusChange={onStatusChange}
+              onDelete={onDelete}
+            />
+          ))}
+        </SortableContext>
+        {tasks.length === 0 && (
+          <div className={cn(
+            "border border-dashed border-border rounded-lg p-4 text-center text-xs text-muted-foreground/60",
+            isOver && "border-primary/50 text-primary/70",
+          )}>
+            Drop tasks here
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function Tasks() {
-  const tid = ACTIVE_TENANT_ID;
+  const { activeTenantId } = useTenantContext();
+  const tid = activeTenantId ?? 0;
   const { toast } = useToast();
   const [view, setView] = useState<"kanban" | "list">("kanban");
   const [showCreate, setShowCreate] = useState(false);
@@ -113,6 +228,19 @@ export default function Tasks() {
     queryKey: ["/api/tenants", tid, "agents"],
     queryFn: () => apiRequest("GET", `/api/tenants/${tid}/agents`).then(r => r.json()),
   });
+
+  const { data: ceoControl } = useQuery<{ mode: "agent" | "me" }>({
+    queryKey: ["/api/tenants", tid, "ceo", "control"],
+    queryFn: () => apiRequest("GET", `/api/tenants/${tid}/ceo/control`).then((r) => r.json()),
+    enabled: tid > 0,
+  });
+
+  // No auth yet: treat the org's CEO agent as "me" for assignment shortcuts.
+  const meAgent = useMemo(() => {
+    const byRole = agents.find((a) => String(a.role).toLowerCase() === "ceo");
+    if (byRole) return byRole;
+    return agents.find((a) => String(a.displayName).trim().toLowerCase() === "ceo") ?? null;
+  }, [agents]);
 
   const { data: teams = [] } = useQuery<Team[]>({
     queryKey: ["/api/tenants", tid, "teams"],
@@ -144,9 +272,16 @@ export default function Tasks() {
   });
 
   const onSubmit = (data: any) => {
+    const rawAssigned = data.assignedAgentId;
+    const resolvedAssigned =
+      rawAssigned === "__me__"
+        ? (meAgent ? String(meAgent.id) : "")
+        : rawAssigned === "__none__"
+          ? ""
+          : rawAssigned;
     createTask.mutate({
       ...data,
-      assignedAgentId: data.assignedAgentId ? Number(data.assignedAgentId) : null,
+      assignedAgentId: resolvedAssigned ? Number(resolvedAssigned) : null,
       teamId: data.teamId ? Number(data.teamId) : null,
     });
   };
@@ -155,6 +290,15 @@ export default function Tasks() {
     acc[s] = tasks.filter(t => t.status === s);
     return acc;
   }, {} as Record<Status, Task[]>);
+
+  const [activeDragTaskId, setActiveDragTaskId] = useState<number | null>(null);
+  const activeDragTask = useMemo(
+    () => (activeDragTaskId ? tasks.find((t) => t.id === activeDragTaskId) ?? null : null),
+    [activeDragTaskId, tasks],
+  );
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+  );
 
   return (
     <div className="p-6 space-y-5 max-w-[1400px] mx-auto">
@@ -178,31 +322,57 @@ export default function Tasks() {
       </div>
 
       {view === "kanban" ? (
-        <div className="grid grid-cols-5 gap-4 overflow-x-auto pb-4" style={{ minWidth: "900px" }}>
-          {STATUSES.map(s => {
-            const sc = STATUS_CONFIG[s];
-            const Icon = sc.icon;
-            return (
-              <div key={s} className="flex flex-col gap-3 kanban-col">
-                <div className="flex items-center gap-2 px-1">
-                  <Icon className={cn("w-3.5 h-3.5", sc.color)} />
-                  <span className="text-xs font-semibold text-muted-foreground">{sc.label}</span>
-                  <span className="ml-auto text-xs text-muted-foreground bg-muted rounded-full px-1.5">{tasksByStatus[s].length}</span>
-                </div>
-                <div className="space-y-2">
-                  {tasksByStatus[s].map(t => (
-                    <TaskCard key={t.id} task={t} agents={agents} onStatusChange={(id, ns) => updateTask.mutate({ id, status: ns })} onDelete={(id) => deleteTask.mutate(id)} />
-                  ))}
-                </div>
-                {tasksByStatus[s].length === 0 && (
-                  <div className="border border-dashed border-border rounded-lg p-4 text-center text-xs text-muted-foreground/50">
-                    Drop tasks here
-                  </div>
-                )}
+        <DndContext
+          sensors={sensors}
+          collisionDetection={closestCorners}
+          onDragStart={(e) => {
+            const id = String(e.active.id);
+            if (id.startsWith("task:")) setActiveDragTaskId(Number(id.split(":")[1]));
+          }}
+          onDragCancel={() => setActiveDragTaskId(null)}
+          onDragEnd={(e) => {
+            const activeId = String(e.active.id);
+            const overId = e.over ? String(e.over.id) : "";
+            setActiveDragTaskId(null);
+            if (!activeId.startsWith("task:") || !overId.startsWith("col:")) return;
+            const taskId = Number(activeId.split(":")[1]);
+            const nextStatus = overId.split(":")[1] as Status;
+            const current = tasks.find((t) => t.id === taskId);
+            if (!current || current.status === nextStatus) return;
+            updateTask.mutate({ id: taskId, status: nextStatus });
+          }}
+        >
+          <div className="grid grid-cols-5 gap-4 overflow-x-auto pb-4" style={{ minWidth: "900px" }}>
+            {STATUSES.map((s) => {
+              const sc = STATUS_CONFIG[s];
+              return (
+                <KanbanColumn
+                  key={s}
+                  status={s}
+                  label={sc.label}
+                  icon={sc.icon}
+                  color={sc.color}
+                  tasks={tasksByStatus[s]}
+                  agents={agents}
+                  onStatusChange={(id, ns) => updateTask.mutate({ id, status: ns })}
+                  onDelete={(id) => deleteTask.mutate(id)}
+                />
+              );
+            })}
+          </div>
+          <DragOverlay>
+            {activeDragTask ? (
+              <div className="w-[260px]">
+                <TaskCard
+                  task={activeDragTask}
+                  agents={agents}
+                  onStatusChange={() => {}}
+                  onDelete={() => {}}
+                />
               </div>
-            );
-          })}
-        </div>
+            ) : null}
+          </DragOverlay>
+        </DndContext>
       ) : (
         <Card className="bg-card border-border">
           <CardContent className="p-0">
@@ -290,9 +460,29 @@ export default function Tasks() {
                 <FormField control={form.control} name="assignedAgentId" render={({ field }) => (
                   <FormItem>
                     <FormLabel>Assign to</FormLabel>
-                    <Select onValueChange={field.onChange} defaultValue={field.value}>
+                    <Select
+                      onValueChange={(v) => {
+                        if (v === "__me__" && !meAgent) {
+                          toast({
+                            title: "No CEO found",
+                            description: "Hire an agent with role “CEO” to enable “Assign to me”.",
+                            variant: "destructive",
+                          });
+                          field.onChange("__none__");
+                          return;
+                        }
+                        field.onChange(v);
+                      }}
+                      defaultValue={field.value}
+                    >
                       <FormControl><SelectTrigger><SelectValue placeholder="Select agent" /></SelectTrigger></FormControl>
                       <SelectContent>
+                        <SelectItem value="__none__">No assignee</SelectItem>
+                        {meAgent && (
+                          <SelectItem value="__me__">
+                            {ceoControl?.mode === "me" ? "Assign to me" : "Assign to me (CEO)"}
+                          </SelectItem>
+                        )}
                         {agents.map(a => <SelectItem key={a.id} value={String(a.id)}>{a.displayName}</SelectItem>)}
                       </SelectContent>
                     </Select>

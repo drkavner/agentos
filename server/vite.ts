@@ -8,6 +8,17 @@ import { nanoid } from "nanoid";
 
 const viteLogger = createLogger();
 
+/** Pathname for routing checks (SPA fallback must not swallow `/api/*`). */
+function requestPathname(req: { originalUrl?: string; url?: string }): string {
+  const raw = (req.originalUrl ?? req.url ?? "").split("?")[0] || "";
+  if (raw.startsWith("/")) return raw;
+  try {
+    return new URL(raw).pathname || "";
+  } catch {
+    return "";
+  }
+}
+
 export async function setupVite(server: Server, app: Express) {
   const serverOptions = {
     middlewareMode: true,
@@ -29,10 +40,32 @@ export async function setupVite(server: Server, app: Express) {
     appType: "custom",
   });
 
-  app.use(vite.middlewares);
+  // If Vite answers first, `/api/*` can incorrectly return `index.html` (200 + HTML). Skip Vite for API paths.
+  app.use((req, res, next) => {
+    if (requestPathname(req).startsWith("/api")) return next();
+    return vite.middlewares(req, res, next);
+  });
 
   app.use("/{*path}", async (req, res, next) => {
+    // Unregistered /api/* must never fall through to the SPA (returns HTML → client JSON.parse errors).
+    const pathname = requestPathname(req);
+    if (pathname.startsWith("/api")) {
+      res.status(404).type("application/json").json({
+        code: "not_found",
+        message: "No API route matched this path. Restart the dev server if you recently added routes.",
+      });
+      return;
+    }
+
     const url = req.originalUrl;
+    const rawPath = (req.originalUrl ?? req.url ?? "").split("?")[0] || "";
+    if (rawPath.includes("/api/")) {
+      console.warn(
+        "[cortex] SPA fallback is serving HTML for a URL that looks like an API path. pathname=%s originalUrl=%s — check Vite path parsing or use `npm run dev` on one port.",
+        pathname,
+        req.originalUrl,
+      );
+    }
 
     try {
       const clientTemplate = path.resolve(

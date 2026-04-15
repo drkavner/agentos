@@ -1,8 +1,8 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import type { Agent, AgentDefinition, Tenant } from "@shared/schema";
-import { ACTIVE_TENANT_ID } from "@/components/AppShell";
+import { useTenantContext } from "@/tenant/TenantContext";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -10,6 +10,8 @@ import { Progress } from "@/components/ui/progress";
 import { Bot, Play, Pause, Trash2, Plus, Clock, CheckCircle, DollarSign, Cpu, Lock } from "lucide-react";
 import { cn, formatDistanceToNow } from "@/lib/utils";
 import { useToast } from "@/hooks/use-toast";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
   AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle
@@ -30,10 +32,12 @@ const MODEL_LABELS: Record<string, string> = {
 };
 
 export default function MyAgents() {
-  const tid = ACTIVE_TENANT_ID;
+  const { activeTenantId } = useTenantContext();
+  const tid = activeTenantId ?? 0;
   const { toast } = useToast();
   const [deleteId, setDeleteId] = useState<number | null>(null);
   const [wizardOpen, setWizardOpen] = useState(false);
+  const [detailsAgentId, setDetailsAgentId] = useState<number | null>(null);
 
   const { data: agents = [], isLoading } = useQuery<Agent[]>({
     queryKey: ["/api/tenants", tid, "agents"],
@@ -48,6 +52,53 @@ export default function MyAgents() {
   const { data: tenant } = useQuery<Tenant>({
     queryKey: ["/api/tenants", tid],
     queryFn: () => apiRequest("GET", `/api/tenants/${tid}`).then(r => r.json()),
+  });
+
+  const selectedAgent = useMemo(
+    () => (detailsAgentId ? agents.find((a) => a.id === detailsAgentId) ?? null : null),
+    [agents, detailsAgentId],
+  );
+  const selectedDef = useMemo(
+    () => (selectedAgent ? defs.find((d) => d.id === selectedAgent.definitionId) ?? null : null),
+    [defs, selectedAgent],
+  );
+
+  const { data: runtimeCtx } = useQuery<any>({
+    queryKey: ["/api/tenants", tid, "agents", selectedAgent?.id ?? 0, "runtime-context"],
+    queryFn: () =>
+      apiRequest("GET", `/api/tenants/${tid}/agents/${selectedAgent!.id}/runtime-context`).then((r) => r.json()),
+    enabled: tid > 0 && !!selectedAgent?.id,
+  });
+
+  const { data: skills } = useQuery<{ markdown: string; source: string; updatedAt?: string }>({
+    queryKey: ["/api/agent-definitions", selectedDef?.id ?? 0, "skills", tid],
+    queryFn: () =>
+      apiRequest("GET", `/api/agent-definitions/${selectedDef!.id}/skills?tenantId=${tid}`).then((r) => r.json()),
+    enabled: tid > 0 && !!selectedDef?.id,
+  });
+
+  const { data: runs = [] } = useQuery<any[]>({
+    queryKey: ["/api/tenants", tid, "agents", selectedAgent?.id ?? 0, "runs"],
+    queryFn: () =>
+      apiRequest("GET", `/api/tenants/${tid}/agents/${selectedAgent!.id}/runs?limit=30`).then((r) => r.json()),
+    enabled: tid > 0 && !!selectedAgent?.id,
+    refetchInterval: detailsAgentId ? 4000 : false,
+  });
+
+  const runOnce = useMutation({
+    mutationFn: async () => {
+      if (!selectedAgent) throw new Error("No agent");
+      return apiRequest("POST", `/api/tenants/${tid}/agents/${selectedAgent.id}/hermes/run-once`).then((r) => r.json());
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/tenants", tid, "agents", selectedAgent?.id ?? 0, "runs"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/tenants", tid, "messages"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/tenants", tid, "tasks"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/tenants", tid, "audit"] });
+    },
+    onError: (e: any) => {
+      toast({ title: "Run failed", description: String(e?.message ?? "Unable to run"), variant: "destructive" });
+    },
   });
 
   const maxAgents = tenant?.maxAgents ?? 25;
@@ -142,8 +193,17 @@ export default function MyAgents() {
             const def = defs.find(d => d.id === agent.definitionId);
             const s = STATUS_CONFIG[agent.status] ?? STATUS_CONFIG.idle;
             const budgetPct = (agent.spentThisMonth / agent.monthlyBudget) * 100;
+            const isCeo = String(agent.role).toLowerCase() === "ceo";
             return (
-              <Card key={agent.id} className="bg-card border-border hover:border-primary/30 transition-all" data-testid={`agent-card-${agent.id}`}>
+              <Card
+                key={agent.id}
+                className="bg-card border-border hover:border-primary/30 transition-all cursor-pointer"
+                data-testid={`agent-card-${agent.id}`}
+                onClick={() => {
+                  if (isCeo) return; // CEO has its own dedicated section
+                  setDetailsAgentId(agent.id);
+                }}
+              >
                 <CardContent className="p-5 space-y-4">
                   {/* Header */}
                   <div className="flex items-start justify-between gap-2">
@@ -161,6 +221,11 @@ export default function MyAgents() {
                     </div>
                     <Badge variant="outline" className={cn("text-xs py-0 shrink-0", s.badge)}>{s.label}</Badge>
                   </div>
+                  {isCeo ? (
+                    <div className="text-[11px] text-muted-foreground">
+                      Manage details in the CEO section.
+                    </div>
+                  ) : null}
 
                   {/* Goal */}
                   {agent.goal && (
@@ -207,17 +272,36 @@ export default function MyAgents() {
                   {/* Actions */}
                   <div className="flex gap-2 pt-1">
                     {agent.status === "running" ? (
-                      <Button size="sm" variant="outline" className="flex-1 text-xs" onClick={() => updateStatus.mutate({ id: agent.id, status: "paused" })} data-testid={`pause-${agent.id}`}>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="flex-1 text-xs"
+                        onClick={(e) => { e.stopPropagation(); updateStatus.mutate({ id: agent.id, status: "paused" }); }}
+                        data-testid={`pause-${agent.id}`}
+                      >
                         <Pause className="w-3 h-3 mr-1" /> Pause
                       </Button>
                     ) : (
-                      <Button size="sm" className="flex-1 text-xs" onClick={() => updateStatus.mutate({ id: agent.id, status: "running" })} data-testid={`start-${agent.id}`}>
+                      <Button
+                        size="sm"
+                        className="flex-1 text-xs"
+                        onClick={(e) => { e.stopPropagation(); updateStatus.mutate({ id: agent.id, status: "running" }); }}
+                        data-testid={`start-${agent.id}`}
+                      >
                         <Play className="w-3 h-3 mr-1" /> Start
                       </Button>
                     )}
-                    <Button size="sm" variant="outline" className="text-destructive hover:bg-destructive/10 border-destructive/30" onClick={() => setDeleteId(agent.id)} data-testid={`delete-${agent.id}`}>
-                      <Trash2 className="w-3 h-3" />
-                    </Button>
+                    {!isCeo ? (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="text-destructive hover:bg-destructive/10 border-destructive/30"
+                        onClick={(e) => { e.stopPropagation(); setDeleteId(agent.id); }}
+                        data-testid={`delete-${agent.id}`}
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </Button>
+                    ) : null}
                   </div>
                 </CardContent>
               </Card>
@@ -227,6 +311,143 @@ export default function MyAgents() {
       )}
 
       <HireAgentWizard open={wizardOpen} onClose={() => setWizardOpen(false)} />
+
+      <Dialog open={detailsAgentId != null} onOpenChange={(o) => setDetailsAgentId(o ? detailsAgentId : null)}>
+        <DialogContent className="max-w-4xl">
+          <DialogHeader>
+            <DialogTitle className="text-sm">
+              {selectedDef?.emoji ?? "🤖"} {selectedAgent?.displayName ?? "Agent"}
+            </DialogTitle>
+            <DialogDescription className="text-xs">
+              {selectedAgent?.role ?? "—"}{selectedAgent ? ` · #${selectedAgent.id}` : ""}
+            </DialogDescription>
+          </DialogHeader>
+
+          {!selectedAgent ? (
+            <div className="text-sm text-muted-foreground">Loading…</div>
+          ) : (
+            <Tabs defaultValue="dashboard" className="w-full">
+              <TabsList>
+                <TabsTrigger value="dashboard">Dashboard</TabsTrigger>
+                <TabsTrigger value="instructions">Instructions</TabsTrigger>
+                <TabsTrigger value="skills">Skills</TabsTrigger>
+                <TabsTrigger value="run">Run</TabsTrigger>
+              </TabsList>
+
+              <TabsContent value="dashboard" className="mt-4 space-y-3">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <Card className="bg-card border-border">
+                    <CardContent className="p-4">
+                      <div className="text-xs text-muted-foreground flex items-center gap-2">
+                        <CheckCircle className="w-3.5 h-3.5" /> Tasks completed
+                      </div>
+                      <div className="text-xl font-semibold">{selectedAgent.tasksCompleted}</div>
+                    </CardContent>
+                  </Card>
+                  <Card className="bg-card border-border">
+                    <CardContent className="p-4">
+                      <div className="text-xs text-muted-foreground flex items-center gap-2">
+                        <DollarSign className="w-3.5 h-3.5" /> Spent this month
+                      </div>
+                      <div className="text-xl font-semibold">${selectedAgent.spentThisMonth.toFixed(2)}</div>
+                    </CardContent>
+                  </Card>
+                  <Card className="bg-card border-border">
+                    <CardContent className="p-4">
+                      <div className="text-xs text-muted-foreground flex items-center gap-2">
+                        <Cpu className="w-3.5 h-3.5" /> Model
+                      </div>
+                      <div className="text-sm font-semibold truncate">
+                        {MODEL_LABELS[selectedAgent.model] ?? selectedAgent.model}
+                      </div>
+                    </CardContent>
+                  </Card>
+                </div>
+                <div className="text-xs text-muted-foreground flex items-center gap-2">
+                  <Clock className="w-3.5 h-3.5" />
+                  <span>
+                    Last heartbeat {selectedAgent.lastHeartbeat ? formatDistanceToNow(selectedAgent.lastHeartbeat) : "—"}
+                  </span>
+                </div>
+                <div className="text-xs text-muted-foreground">
+                  Status: <span className="text-foreground">{selectedAgent.status}</span> · Budget:{" "}
+                  <span className="text-foreground">${selectedAgent.spentThisMonth.toFixed(2)} / ${selectedAgent.monthlyBudget}</span>
+                </div>
+              </TabsContent>
+
+              <TabsContent value="instructions" className="mt-4 space-y-3">
+                <Card className="bg-card border-border">
+                  <CardContent className="p-4 space-y-2">
+                    <div className="text-xs text-muted-foreground">Goal</div>
+                    <div className="text-sm">{selectedAgent.goal ?? "—"}</div>
+                  </CardContent>
+                </Card>
+                <Card className="bg-card border-border">
+                  <CardContent className="p-4 space-y-2">
+                    <div className="text-xs text-muted-foreground">System prompt (preview)</div>
+                    <pre className="text-xs whitespace-pre-wrap bg-muted/30 border border-border rounded-md p-3 max-h-[320px] overflow-auto">
+{runtimeCtx?.systemPrompt ?? "—"}
+                    </pre>
+                  </CardContent>
+                </Card>
+              </TabsContent>
+
+              <TabsContent value="skills" className="mt-4 space-y-3">
+                <Card className="bg-card border-border">
+                  <CardContent className="p-4 space-y-2">
+                    <div className="text-xs text-muted-foreground">
+                      skills.md (source: {skills?.source ?? "—"})
+                    </div>
+                    <pre className="text-xs whitespace-pre-wrap bg-muted/30 border border-border rounded-md p-3 max-h-[420px] overflow-auto">
+{skills?.markdown ?? "—"}
+                    </pre>
+                  </CardContent>
+                </Card>
+              </TabsContent>
+
+              <TabsContent value="run" className="mt-4 space-y-3">
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <div className="text-sm text-muted-foreground">Run logs</div>
+                  <Button size="sm" onClick={() => runOnce.mutate()} disabled={runOnce.isPending}>
+                    {runOnce.isPending ? "Running…" : "Run now"}
+                  </Button>
+                </div>
+                {tenant?.adapterType === "openclaw" ? (
+                  <p className="text-xs text-muted-foreground border border-border rounded-md p-3 bg-muted/20">
+                    OpenClaw: Cortex records the run and posts a channel update. Heavy execution still happens in your OpenClaw gateway.
+                  </p>
+                ) : null}
+                <div className="border border-border rounded-md divide-y divide-border max-h-[420px] overflow-auto">
+                  {runs.map((r) => (
+                    <div key={r.id} className="px-3 py-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="text-xs font-mono">#{r.id}</div>
+                        <Badge variant="outline" className="text-[10px] py-0">{r.trigger}</Badge>
+                        <Badge
+                          variant="outline"
+                          className={cn(
+                            "text-[10px] py-0",
+                            r.status === "failed" ? "border-red-500/30 text-red-300" : "",
+                          )}
+                        >
+                          {r.status}
+                        </Badge>
+                        <div className="text-xs text-muted-foreground ml-auto">{new Date(r.startedAt).toLocaleTimeString()}</div>
+                      </div>
+                      <div className="text-xs text-muted-foreground mt-1">
+                        {r.error ? `Error: ${r.error}` : (r.summary ?? "—")}
+                      </div>
+                    </div>
+                  ))}
+                  {runs.length === 0 ? (
+                    <div className="p-4 text-sm text-muted-foreground">No runs yet.</div>
+                  ) : null}
+                </div>
+              </TabsContent>
+            </Tabs>
+          )}
+        </DialogContent>
+      </Dialog>
 
       <AlertDialog open={deleteId !== null} onOpenChange={() => setDeleteId(null)}>
         <AlertDialogContent>

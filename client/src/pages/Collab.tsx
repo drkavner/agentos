@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import type { Message, Agent, Team } from "@shared/schema";
-import { ACTIVE_TENANT_ID } from "@/components/AppShell";
+import { useTenantContext } from "@/tenant/TenantContext";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -29,7 +29,8 @@ interface ChannelDef {
 }
 
 export default function Collab() {
-  const tid = ACTIVE_TENANT_ID;
+  const { activeTenantId, activeTenant } = useTenantContext();
+  const tid = activeTenantId ?? 0;
   const [activeChannel, setActiveChannel] = useState("general");
   const [inputVal, setInputVal] = useState("");
   const [senderName, setSenderName] = useState("You");
@@ -38,18 +39,22 @@ export default function Collab() {
   const { data: agents = [] } = useQuery<Agent[]>({
     queryKey: ["/api/tenants", tid, "agents"],
     queryFn: () => apiRequest("GET", `/api/tenants/${tid}/agents`).then(r => r.json()),
+    enabled: tid > 0,
   });
 
   const { data: teams = [] } = useQuery<Team[]>({
     queryKey: ["/api/tenants", tid, "teams"],
     queryFn: () => apiRequest("GET", `/api/tenants/${tid}/teams`).then(r => r.json()),
+    enabled: tid > 0,
   });
 
-  const { data: messages = [], refetch } = useQuery<Message[]>({
+  const messagesQuery = useQuery<Message[]>({
     queryKey: ["/api/tenants", tid, "messages", activeChannel],
     queryFn: () => apiRequest("GET", `/api/tenants/${tid}/messages?channelId=${activeChannel}`).then(r => r.json()),
-    refetchInterval: 3000,
+    enabled: tid > 0,
+    refetchInterval: 5000,
   });
+  const messages = messagesQuery.data ?? [];
 
   const sendMessage = useMutation({
     mutationFn: (content: string) => apiRequest("POST", `/api/tenants/${tid}/messages`, {
@@ -61,7 +66,7 @@ export default function Collab() {
       messageType: "chat",
     }).then(r => r.json()),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["/api/tenants", tid, "messages", activeChannel] });
+      queryClient.invalidateQueries({ queryKey: ["/api/tenants", tid, "messages"] });
       setInputVal("");
     },
   });
@@ -73,7 +78,10 @@ export default function Collab() {
   const channels: ChannelDef[] = [
     { id: "general", label: "general", icon: Hash, type: "general" },
     ...teams.map(t => ({ id: `team-${t.id}`, label: t.name.toLowerCase(), icon: Users, type: "team" as const })),
-    ...agents.slice(0, 3).map(a => ({ id: `dm-${a.id}`, label: a.displayName.toLowerCase(), icon: MessageSquare, type: "dm" as const })),
+    ...agents
+      .slice()
+      .sort((a, b) => a.displayName.localeCompare(b.displayName))
+      .map(a => ({ id: `dm-${a.id}`, label: a.displayName.toLowerCase(), icon: MessageSquare, type: "dm" as const })),
   ];
 
   const activeChannelDef = channels.find(c => c.id === activeChannel);
@@ -110,9 +118,12 @@ export default function Collab() {
 
         {/* Online agents */}
         <div className="border-t border-border px-4 py-3">
-          <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">
-            Online ({runningAgents.length})
+          <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">
+            Running ({runningAgents.length})
           </div>
+          <p className="text-[10px] text-muted-foreground leading-snug mb-2">
+            Status = &ldquo;running&rdquo; in My Agents, not live chat presence.
+          </p>
           <div className="space-y-1.5">
             {runningAgents.map(a => (
               <div key={a.id} className="flex items-center gap-2">
@@ -134,14 +145,33 @@ export default function Collab() {
             <Badge variant="outline" className="text-xs py-0">{activeChannelDef?.type}</Badge>
           </div>
           <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            <Zap className="w-3.5 h-3.5 text-primary" />
-            <span>Live · refreshing every 3s</span>
+            {activeTenant && (
+              <Badge variant="outline" className="text-[10px] py-0 h-5">
+                org: {activeTenant.name} (#{activeTenant.id})
+              </Badge>
+            )}
+            <div className="flex flex-col items-end text-[10px] text-muted-foreground max-w-[220px] leading-tight text-right">
+              <span className="inline-flex items-center gap-1">
+                <Zap className="w-3 h-3 text-primary shrink-0" />
+                Tenant SSE
+              </span>
+              <span className="mt-0.5">
+                Refreshes on a short poll and when the server pushes updates. Sending as{" "}
+                <span className="text-foreground/80">You</span> triggers a Cortex agent reply (OpenClaw or Hermes); use Run / heartbeat for deeper work.
+              </span>
+            </div>
           </div>
         </div>
 
         {/* Messages */}
         <div className="flex-1 overflow-y-auto px-6 py-4 space-y-3">
-          {messages.length === 0 ? (
+          {messagesQuery.isError ? (
+            <div className="flex flex-col items-center justify-center h-full text-muted-foreground">
+              <MessageSquare className="w-12 h-12 mb-3 opacity-20" />
+              <p className="text-sm">Can’t load messages for this channel</p>
+              <p className="text-xs mt-1">{(messagesQuery.error as Error)?.message ?? "Unknown error"}</p>
+            </div>
+          ) : messages.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-full text-muted-foreground">
               <MessageSquare className="w-12 h-12 mb-3 opacity-20" />
               <p className="text-sm">No messages in this channel yet</p>

@@ -1,7 +1,16 @@
 import express, { type Request, Response, NextFunction } from "express";
+import path from "path";
+import { migrate } from "drizzle-orm/better-sqlite3/migrator";
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
 import { createServer } from "http";
+import type { AddressInfo } from "net";
+import { db } from "./db";
+import { seedDatabase } from "./seed";
+import { ensureAgentDefinitionsCatalog } from "./agentDefinitionsCatalog";
+import { repairAllTenantsMissingCeo } from "./ceoBootstrap";
+import { isApiError, type ApiErrorResponse } from "./apiError";
+import { startHeartbeatRunner } from "./heartbeatRunner";
 
 const app = express();
 const httpServer = createServer(app);
@@ -60,19 +69,43 @@ app.use((req, res, next) => {
 });
 
 (async () => {
+  // Ensure DB schema is up-to-date before anything touches tables.
+  migrate(db, { migrationsFolder: path.join(process.cwd(), "migrations") });
+
+  // Agent Library catalog must exist even when full demo seed is disabled (e.g. production).
+  ensureAgentDefinitionsCatalog();
+
+  const shouldSeed =
+    process.env.SEED === "true" ||
+    (process.env.SEED !== "false" && process.env.NODE_ENV !== "production");
+  if (shouldSeed) {
+    seedDatabase();
+  }
+
   await registerRoutes(httpServer, app);
+  repairAllTenantsMissingCeo();
+  startHeartbeatRunner();
 
   app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
     const status = err.status || err.statusCode || 500;
-    const message = err.message || "Internal Server Error";
 
-    console.error("Internal Server Error:", err);
+    if (status >= 500) {
+      console.error("Internal Server Error:", err);
+    } else if (isApiError(err)) {
+      // Expected 4xx — don’t log as internal server failure
+    } else {
+      console.error("Request error:", err);
+    }
 
     if (res.headersSent) {
       return next(err);
     }
 
-    return res.status(status).json({ message });
+    const body: ApiErrorResponse = isApiError(err)
+      ? { code: err.code, message: err.message, details: err.details }
+      : { code: "internal_error", message: err?.message || "Internal Server Error" };
+
+    return res.status(status).json(body);
   });
 
   // importantly only setup vite in development and after
@@ -89,15 +122,30 @@ app.use((req, res, next) => {
   // Other ports are firewalled. Default to 5000 if not specified.
   // this serves both the API and the client.
   // It is the only port that is not firewalled.
-  const port = parseInt(process.env.PORT || "5000", 10);
-  httpServer.listen(
-    {
-      port,
-      host: "0.0.0.0",
-      reusePort: true,
-    },
-    () => {
-      log(`serving on port ${port}`);
-    },
-  );
+  const requestedPort = parseInt(process.env.PORT || "5000", 10);
+  const host =
+    process.env.HOST ||
+    (process.env.NODE_ENV === "production" ? "0.0.0.0" : "127.0.0.1");
+
+  const startServer = (port: number, attemptsLeft: number) => {
+    httpServer.once("error", (err: any) => {
+      if (
+        err?.code === "EADDRINUSE" &&
+        process.env.NODE_ENV !== "production" &&
+        attemptsLeft > 0
+      ) {
+        startServer(port + 1, attemptsLeft - 1);
+        return;
+      }
+      throw err;
+    });
+
+    httpServer.listen({ port, host }, () => {
+      const addr = httpServer.address() as AddressInfo | null;
+      const actualPort = addr?.port ?? port;
+      log(`serving on port ${actualPort}`);
+    });
+  };
+
+  startServer(requestedPort, 20);
 })();

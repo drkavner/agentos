@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
-import { apiRequest, queryClient } from "@/lib/queryClient";
+import { apiRequest, queryClient, readJsonOrApiHint } from "@/lib/queryClient";
 import type { AgentDefinition, Team, Tenant } from "@shared/schema";
-import { ACTIVE_TENANT_ID } from "./AppShell";
+import { TENANT_ADAPTER_LABELS, type TenantAdapterType } from "@shared/schema";
+import { useTenantContext } from "@/tenant/TenantContext";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle,
 } from "@/components/ui/dialog";
@@ -16,7 +17,7 @@ import {
 } from "@/components/ui/select";
 import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
-import { Check, ChevronRight, Bot, Cpu, Target, Users, DollarSign } from "lucide-react";
+import { Check, ChevronRight, Bot, Cpu, Target, Users, DollarSign, Globe } from "lucide-react";
 
 const MODELS = [
   { id: "claude-opus-4", label: "Claude Opus 4", desc: "Most capable, best reasoning", cost: "~$0.015/1k tokens" },
@@ -26,6 +27,9 @@ const MODELS = [
   { id: "gemini-2.0-flash", label: "Gemini 2.0 Flash", desc: "Google, very fast", cost: "~$0.0001/1k tokens" },
   { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", desc: "Google's best", cost: "~$0.007/1k tokens" },
 ];
+
+// Radix Select does not support empty-string item values; using a sentinel avoids a runtime crash when the "Assign Team" step mounts.
+const NO_MANAGER_VALUE = "__no_manager__";
 
 const HEARTBEATS = [
   { value: "*/5 * * * *", label: "Every 5 minutes" },
@@ -52,7 +56,8 @@ interface HireAgentWizardProps {
 }
 
 export function HireAgentWizard({ open, onClose, preselectedDef }: HireAgentWizardProps) {
-  const tid = ACTIVE_TENANT_ID;
+  const { activeTenantId } = useTenantContext();
+  const tid = activeTenantId ?? 0;
   const { toast } = useToast();
 
   const [step, setStep] = useState(preselectedDef ? 1 : 0);
@@ -65,10 +70,12 @@ export function HireAgentWizard({ open, onClose, preselectedDef }: HireAgentWiza
   const [role, setRole] = useState("");
   const [goal, setGoal] = useState("");
   const [model, setModel] = useState("claude-3-5-sonnet");
+  /** Where the model id is executed: OpenRouter (cloud) or local Ollama. */
+  const [llmProvider, setLlmProvider] = useState<"openrouter" | "ollama">("openrouter");
   const [monthlyBudget, setMonthlyBudget] = useState(100);
   const [heartbeat, setHeartbeat] = useState("*/30 * * * *");
   const [teamId, setTeamId] = useState<string>("");
-  const [managerId, setManagerId] = useState<string>("");
+  const [managerId, setManagerId] = useState<string>(NO_MANAGER_VALUE);
 
   const { data: defs = [] } = useQuery<AgentDefinition[]>({
     queryKey: ["/api/agent-definitions"],
@@ -92,6 +99,28 @@ export function HireAgentWizard({ open, onClose, preselectedDef }: HireAgentWiza
     queryFn: () => apiRequest("GET", `/api/tenants/${tid}`).then(r => r.json()),
     enabled: open,
   });
+
+  const { data: ollamaModelsRes, isLoading: ollamaModelsLoading, isError: ollamaModelsError } = useQuery<{
+    baseUsed: string;
+    models: string[];
+  }>({
+    queryKey: ["/api/tenants", tid, "ollama", "models", tenant?.ollamaBaseUrl ?? ""],
+    queryFn: () => apiRequest("GET", `/api/tenants/${tid}/ollama/models`).then((r) => readJsonOrApiHint(r)),
+    enabled: open && tid > 0 && llmProvider === "ollama",
+    retry: false,
+  });
+
+  useEffect(() => {
+    if (llmProvider !== "ollama") return;
+    const list = ollamaModelsRes?.models;
+    if (!list?.length) return;
+    if (!list.includes(model)) setModel(list[0]!);
+  }, [llmProvider, ollamaModelsRes?.models, model]);
+
+  useEffect(() => {
+    if (llmProvider !== "openrouter") return;
+    if (!MODELS.some((m) => m.id === model)) setModel("claude-3-5-sonnet");
+  }, [llmProvider, model]);
 
   const hire = useMutation({
     mutationFn: async (data: any) => {
@@ -127,8 +156,8 @@ export function HireAgentWizard({ open, onClose, preselectedDef }: HireAgentWiza
 
   function resetForm() {
     setStep(0); setSelectedDef(null); setDisplayName(""); setRole("");
-    setGoal(""); setModel("claude-3-5-sonnet"); setMonthlyBudget(100);
-    setHeartbeat("*/30 * * * *"); setTeamId(""); setManagerId(""); setSearchTerm("");
+    setGoal(""); setModel("claude-3-5-sonnet"); setLlmProvider("openrouter"); setMonthlyBudget(100);
+    setHeartbeat("*/30 * * * *"); setTeamId(""); setManagerId(NO_MANAGER_VALUE); setSearchTerm("");
   }
 
   function selectDef(def: AgentDefinition) {
@@ -147,7 +176,10 @@ export function HireAgentWizard({ open, onClose, preselectedDef }: HireAgentWiza
     return matchDiv && matchSearch;
   });
 
-  const selectedModel = MODELS.find(m => m.id === model);
+  const modelReviewLabel =
+    llmProvider === "openrouter" ? (MODELS.find((m) => m.id === model)?.label ?? model) : model;
+  const modelReviewCost =
+    llmProvider === "openrouter" ? (MODELS.find((m) => m.id === model)?.cost ?? "") : "Local · $0";
 
   function handleHire() {
     hire.mutate({
@@ -156,9 +188,10 @@ export function HireAgentWizard({ open, onClose, preselectedDef }: HireAgentWiza
       role,
       goal,
       model,
+      llmProvider,
       monthlyBudget,
       heartbeatSchedule: heartbeat,
-      managerId: managerId ? Number(managerId) : null,
+      managerId: managerId && managerId !== NO_MANAGER_VALUE ? Number(managerId) : null,
       status: "idle",
     });
   }
@@ -171,6 +204,15 @@ export function HireAgentWizard({ open, onClose, preselectedDef }: HireAgentWiza
             <Bot className="w-5 h-5 text-primary" />
             Hire an Agent
           </DialogTitle>
+          {tenant && (
+            <p className="text-xs text-muted-foreground pt-1">
+              Execution adapter:{" "}
+              <span className="text-foreground font-medium">
+                {TENANT_ADAPTER_LABELS[(tenant.adapterType === "openclaw" ? "openclaw" : "hermes") as TenantAdapterType]}
+              </span>
+              {" "}(all library hires for this org)
+            </p>
+          )}
         </DialogHeader>
 
         {/* Step indicator */}
@@ -301,29 +343,104 @@ export function HireAgentWizard({ open, onClose, preselectedDef }: HireAgentWiza
           {step === 2 && (
             <div className="space-y-4">
               <div>
-                <Label className="text-xs mb-2 block">LLM Model</Label>
-                <div className="grid grid-cols-1 gap-2">
-                  {MODELS.map(m => (
+                <Label className="text-xs mb-2 block">LLM provider</Label>
+                <div className="grid grid-cols-2 gap-2">
+                  {(
+                    [
+                      { id: "openrouter" as const, title: "OpenRouter", desc: "Cloud — one API key on the server" },
+                      { id: "ollama" as const, title: "Ollama", desc: "Local — base URL in Settings → Organization" },
+                    ] as const
+                  ).map((p) => (
                     <button
-                      key={m.id}
-                      onClick={() => setModel(m.id)}
+                      key={p.id}
+                      type="button"
+                      onClick={() => setLlmProvider(p.id)}
                       className={cn(
-                        "flex items-center justify-between p-3 rounded-lg border text-left transition-all",
-                        model === m.id ? "border-primary bg-primary/10" : "border-border bg-card hover:border-primary/40"
+                        "flex flex-col items-start p-3 rounded-lg border text-left transition-all",
+                        llmProvider === p.id ? "border-primary bg-primary/10" : "border-border bg-card hover:border-primary/40",
                       )}
-                      data-testid={`model-${m.id}`}
+                      data-testid={`wizard-llm-${p.id}`}
                     >
-                      <div>
-                        <p className="text-sm font-medium text-foreground">{m.label}</p>
-                        <p className="text-xs text-muted-foreground">{m.desc}</p>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs font-mono text-muted-foreground">{m.cost}</span>
-                        {model === m.id && <Check className="w-4 h-4 text-primary" />}
-                      </div>
+                      <p className="text-sm font-medium text-foreground">{p.title}</p>
+                      <p className="text-xs text-muted-foreground mt-0.5">{p.desc}</p>
+                      {llmProvider === p.id && <Check className="w-4 h-4 text-primary mt-2 self-end" />}
                     </button>
                   ))}
                 </div>
+                <p className="text-xs text-muted-foreground mt-1.5">
+                  {llmProvider === "openrouter"
+                    ? "Pick a model id OpenRouter accepts."
+                    : "Models are loaded live from your Ollama instance (Settings → Organization)."}
+                </p>
+              </div>
+              <div>
+                <Label className="text-xs mb-2 block">LLM Model</Label>
+                {llmProvider === "openrouter" ? (
+                  <div className="grid grid-cols-1 gap-2">
+                    {MODELS.map((m) => (
+                      <button
+                        key={m.id}
+                        type="button"
+                        onClick={() => setModel(m.id)}
+                        className={cn(
+                          "flex items-center justify-between p-3 rounded-lg border text-left transition-all",
+                          model === m.id ? "border-primary bg-primary/10" : "border-border bg-card hover:border-primary/40",
+                        )}
+                        data-testid={`model-${m.id}`}
+                      >
+                        <div>
+                          <p className="text-sm font-medium text-foreground">{m.label}</p>
+                          <p className="text-xs text-muted-foreground">{m.desc}</p>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs font-mono text-muted-foreground">{m.cost}</span>
+                          {model === m.id && <Check className="w-4 h-4 text-primary" />}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {ollamaModelsLoading ? (
+                      <p className="text-xs text-muted-foreground py-4 text-center">Loading models from Ollama…</p>
+                    ) : ollamaModelsError ? (
+                      <p className="text-xs text-destructive py-2">
+                        Could not list models. Save your Ollama URL in Settings, ensure <span className="font-mono">ollama serve</span> is running, then reopen this step.
+                      </p>
+                    ) : (ollamaModelsRes?.models?.length ?? 0) === 0 ? (
+                      <p className="text-xs text-muted-foreground py-2">
+                        No models found at{" "}
+                        <span className="font-mono text-foreground">{ollamaModelsRes?.baseUsed ?? "—"}</span>. Pull one with{" "}
+                        <span className="font-mono">ollama pull llama3</span> (or open Settings → Detect models).
+                      </p>
+                    ) : (
+                      <div className="grid grid-cols-1 gap-2 max-h-[min(50vh,320px)] overflow-y-auto pr-1">
+                        {ollamaModelsRes!.models.map((id) => (
+                          <button
+                            key={id}
+                            type="button"
+                            onClick={() => setModel(id)}
+                            className={cn(
+                              "flex items-center justify-between p-3 rounded-lg border text-left transition-all",
+                              model === id ? "border-primary bg-primary/10" : "border-border bg-card hover:border-primary/40",
+                            )}
+                            data-testid={`model-ollama-${id.replace(/[^a-zA-Z0-9_-]/g, "_")}`}
+                          >
+                            <div className="min-w-0">
+                              <p className="text-sm font-medium text-foreground font-mono truncate" title={id}>
+                                {id}
+                              </p>
+                              <p className="text-xs text-muted-foreground">
+                                Ollama · {ollamaModelsRes?.baseUsed ?? ""}
+                              </p>
+                            </div>
+                            {model === id && <Check className="w-4 h-4 text-primary shrink-0" />}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
 
               <div className="grid grid-cols-2 gap-4">
@@ -403,7 +520,7 @@ export function HireAgentWizard({ open, onClose, preselectedDef }: HireAgentWiza
                     <SelectValue placeholder="No manager (top-level)" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="">No manager (top-level)</SelectItem>
+                    <SelectItem value={NO_MANAGER_VALUE}>No manager (top-level)</SelectItem>
                     {agents.map((a: any) => (
                       <SelectItem key={a.id} value={String(a.id)}>
                         {a.displayName} — {a.role}
@@ -435,7 +552,21 @@ export function HireAgentWizard({ open, onClose, preselectedDef }: HireAgentWiza
                 <div className="p-4 space-y-3">
                   {[
                     { icon: Target, label: "Goal", value: goal || "No goal set" },
-                    { icon: Cpu, label: "Model", value: selectedModel?.label ?? model },
+                    {
+                      icon: Globe,
+                      label: "LLM provider",
+                      value: llmProvider === "openrouter" ? "OpenRouter" : "Ollama",
+                    },
+                    {
+                      icon: Cpu,
+                      label: "Model",
+                      value:
+                        llmProvider === "ollama"
+                          ? [model, ollamaModelsRes?.baseUsed ? `Base: ${ollamaModelsRes.baseUsed}` : null]
+                              .filter(Boolean)
+                              .join("\n")
+                          : `${modelReviewLabel} · ${modelReviewCost}`,
+                    },
                     { icon: DollarSign, label: "Budget", value: `$${monthlyBudget}/month` },
                     { icon: Bot, label: "Heartbeat", value: HEARTBEATS.find(h => h.value === heartbeat)?.label ?? heartbeat },
                     { icon: Users, label: "Team", value: teams.find(t => String(t.id) === teamId)?.name ?? "Independent" },
@@ -445,7 +576,7 @@ export function HireAgentWizard({ open, onClose, preselectedDef }: HireAgentWiza
                       <item.icon className="w-4 h-4 text-muted-foreground mt-0.5 flex-shrink-0" />
                       <div>
                         <p className="text-xs text-muted-foreground">{item.label}</p>
-                        <p className="text-sm text-foreground">{item.value}</p>
+                        <p className="text-sm text-foreground whitespace-pre-line">{item.value}</p>
                       </div>
                     </div>
                   ))}
