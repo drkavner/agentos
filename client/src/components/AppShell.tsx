@@ -1,5 +1,6 @@
-import { useState, useEffect } from "react";
+import { useMemo, useState, useEffect } from "react";
 import { Link, useLocation } from "wouter";
+import { useQuery } from "@tanstack/react-query";
 import {
   LayoutDashboard, Bot, Users, Network, CheckSquare,
   MessageSquare, Settings, Building2, ScrollText,
@@ -10,6 +11,7 @@ import { cn } from "@/lib/utils";
 import { useTenantContext } from "@/tenant/TenantContext";
 import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { apiRequest } from "@/lib/queryClient";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -62,6 +64,21 @@ export function AppShell({ children }: AppShellProps) {
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
 
   const { tenants, activeTenantId, setActiveTenantId, activeTenant } = useTenantContext();
+  const tid = activeTenantId ?? 0;
+  const { data: ceoControl } = useQuery<{ enabled?: boolean; mode?: "agent" | "me" }>({
+    queryKey: ["/api/tenants", tid, "ceo", "control"],
+    queryFn: () => apiRequest("GET", `/api/tenants/${tid}/ceo/control`).then((r) => r.json()),
+    enabled: tid > 0,
+  });
+  const hasCeo = ceoControl?.enabled !== false;
+  const nav = useMemo(() => {
+    if (hasCeo) return NAV;
+    return NAV.map((g) =>
+      g.label === "Work"
+        ? { ...g, items: g.items.filter((it) => it.href !== "/ceo/dashboard") }
+        : g,
+    );
+  }, [hasCeo]);
 
   useEffect(() => {
     document.documentElement.classList.toggle("light", !dark);
@@ -124,7 +141,7 @@ export function AppShell({ children }: AppShellProps) {
 
       {/* Nav */}
       <nav className="flex-1 overflow-y-auto py-3 px-2 space-y-4">
-        {NAV.map(group => (
+        {nav.map(group => (
           <div key={group.label}>
             {sidebarOpen && (
               <div className="px-2 mb-1 text-xs font-semibold uppercase tracking-widest text-muted-foreground/60">

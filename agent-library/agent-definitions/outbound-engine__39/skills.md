@@ -1,4 +1,4 @@
-# Outbound Engine — Skills
+# 📬 Outbound Engine — SKILLS
 
 ## Summary
 Cold outbound optimizer, lead pipeline, competitive monitor
@@ -9,7 +9,7 @@ Marketing Ops
 ## Skills
 - ICP definition to emails in inbox — fully automated
 
-## When to use
+## When to Use
 Fully automated outbound from ICP to inbox
 
 ## Source

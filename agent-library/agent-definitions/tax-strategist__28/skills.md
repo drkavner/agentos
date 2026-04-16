@@ -1,4 +1,4 @@
-# Tax Strategist — Skills
+# 🏛️ Tax Strategist — SKILLS
 
 ## Summary
 Handles entity structuring, ETR analysis, and audit defense
@@ -10,7 +10,7 @@ Finance
 - Tax optimization
 - multi-jurisdictional compliance
 
-## When to use
+## When to Use
 Entity structuring, ETR analysis, audit defense, strategic tax planning
 
 ## Source

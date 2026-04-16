@@ -1,4 +1,4 @@
-# Revenue Intelligence — Skills
+# 💡 Revenue Intelligence — SKILLS
 
 ## Summary
 Gong insight pipeline, revenue attribution, client report generator
@@ -9,7 +9,7 @@ Marketing Ops
 ## Skills
 - Prove content ROI and turn sales calls into strategy
 
-## When to use
+## When to Use
 Proving content ROI and extracting call intelligence
 
 ## Source

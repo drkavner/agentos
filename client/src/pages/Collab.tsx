@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import type { Message, Agent, Team } from "@shared/schema";
@@ -6,7 +6,7 @@ import { useTenantContext } from "@/tenant/TenantContext";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Send, Hash, MessageSquare, Users, Zap } from "lucide-react";
+import { Send, Hash, MessageSquare, Users, Zap, Download, FileCode, FolderDown } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const MSG_TYPE_CONFIG: Record<string, { label: string; class: string }> = {
@@ -19,6 +19,140 @@ const MSG_TYPE_CONFIG: Record<string, { label: string; class: string }> = {
 
 function formatTime(dateStr: string) {
   return new Date(dateStr).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function parseMeta(msg: Message): Record<string, any> {
+  if (!msg.metadata) return {};
+  if (typeof msg.metadata === "object") return msg.metadata as any;
+  try { return JSON.parse(msg.metadata as string); } catch { return {}; }
+}
+
+function RenderedContent({ content }: { content: string }) {
+  const parts = useMemo(() => {
+    const result: { type: "text" | "code"; lang?: string; value: string }[] = [];
+    const lines = content.split("\n");
+    let inCode = false;
+    let codeLang = "";
+    let codeLines: string[] = [];
+    let textLines: string[] = [];
+
+    for (const line of lines) {
+      if (!inCode && line.startsWith("```")) {
+        if (textLines.length > 0) {
+          result.push({ type: "text", value: textLines.join("\n") });
+          textLines = [];
+        }
+        inCode = true;
+        codeLang = line.slice(3).trim();
+        codeLines = [];
+      } else if (inCode && line.trimEnd() === "```") {
+        result.push({ type: "code", lang: codeLang, value: codeLines.join("\n") });
+        inCode = false;
+        codeLang = "";
+        codeLines = [];
+      } else if (inCode) {
+        codeLines.push(line);
+      } else {
+        textLines.push(line);
+      }
+    }
+    if (inCode && codeLines.length > 0) {
+      result.push({ type: "code", lang: codeLang, value: codeLines.join("\n") });
+    }
+    if (textLines.length > 0) {
+      result.push({ type: "text", value: textLines.join("\n") });
+    }
+    return result;
+  }, [content]);
+
+  return (
+    <div className="space-y-2">
+      {parts.map((p, i) =>
+        p.type === "code" ? (
+          <div key={i} className="relative rounded-lg overflow-hidden border border-border bg-[#1e1e2e]">
+            {p.lang && (
+              <div className="flex items-center justify-between px-3 py-1.5 bg-[#181825] border-b border-border">
+                <span className="text-[10px] font-mono text-muted-foreground uppercase">{p.lang}</span>
+                <button
+                  className="text-[10px] text-muted-foreground hover:text-foreground transition-colors"
+                  onClick={() => navigator.clipboard.writeText(p.value)}
+                >
+                  Copy
+                </button>
+              </div>
+            )}
+            <pre className="px-3 py-2.5 overflow-x-auto text-xs font-mono leading-relaxed text-[#cdd6f4]">
+              <code>{p.value}</code>
+            </pre>
+          </div>
+        ) : (
+          <div key={i} className="whitespace-pre-wrap">
+            {p.value.split("\n").map((line, j) => {
+              if (line.startsWith("# ")) return <h2 key={j} className="text-base font-bold mt-2 mb-1">{line.slice(2)}</h2>;
+              if (line.startsWith("## ")) return <h3 key={j} className="text-sm font-bold mt-2 mb-0.5">{line.slice(3)}</h3>;
+              if (line.startsWith("### ")) return <h4 key={j} className="text-sm font-semibold mt-1.5">{line.slice(4)}</h4>;
+              if (line.startsWith("- ") || line.startsWith("* ")) return <div key={j} className="pl-3 flex gap-1.5"><span className="text-muted-foreground">•</span><span>{renderInline(line.slice(2))}</span></div>;
+              if (line.match(/^\d+\.\s/)) return <div key={j} className="pl-3">{renderInline(line)}</div>;
+              if (line.startsWith("✅") || line.startsWith("🚀") || line.startsWith("📁") || line.startsWith("📋") || line.startsWith("🎯")) return <div key={j}>{renderInline(line)}</div>;
+              if (line.trim() === "") return <div key={j} className="h-1.5" />;
+              return <div key={j}>{renderInline(line)}</div>;
+            })}
+          </div>
+        ),
+      )}
+    </div>
+  );
+}
+
+function renderInline(text: string) {
+  const parts = text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g);
+  return parts.map((p, i) => {
+    if (p.startsWith("`") && p.endsWith("`"))
+      return <code key={i} className="px-1 py-0.5 rounded bg-muted text-xs font-mono text-primary">{p.slice(1, -1)}</code>;
+    if (p.startsWith("**") && p.endsWith("**"))
+      return <strong key={i} className="font-semibold">{p.slice(2, -2)}</strong>;
+    return <span key={i}>{p}</span>;
+  });
+}
+
+function DeliverableDownloadButton({ tenantId, taskId, fileCount }: { tenantId: number; taskId: number; fileCount: number }) {
+  const [downloading, setDownloading] = useState(false);
+
+  const handleDownload = async () => {
+    setDownloading(true);
+    try {
+      const res = await fetch(`/api/tenants/${tenantId}/tasks/${taskId}/deliverables/download`);
+      if (!res.ok) throw new Error("Download failed");
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = res.headers.get("content-disposition")?.match(/filename="(.+)"/)?.[1] ?? `task-${taskId}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error("Download error:", e);
+    } finally {
+      setDownloading(false);
+    }
+  };
+
+  return (
+    <button
+      onClick={handleDownload}
+      disabled={downloading}
+      className={cn(
+        "mt-2 inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-all",
+        "bg-primary/10 text-primary hover:bg-primary/20 border border-primary/20",
+        downloading && "opacity-50 cursor-wait",
+      )}
+    >
+      <FolderDown className="w-3.5 h-3.5" />
+      {downloading ? "Downloading..." : `Download ${fileCount} file${fileCount !== 1 ? "s" : ""} (.zip)`}
+    </button>
+  );
 }
 
 interface ChannelDef {
@@ -206,7 +340,20 @@ export default function Collab() {
                       </div>
                     )}
                     <div className={cn("text-sm text-foreground leading-relaxed rounded-md px-0", tc.class && `${tc.class} px-3 py-2`)}>
-                      {msg.content}
+                      {(() => {
+                        const meta = parseMeta(msg);
+                        const hasCode = msg.content.includes("```");
+                        const deliverableFiles = meta.deliverableFiles as string[] | undefined;
+                        const taskId = meta.taskId as number | undefined;
+                        return (
+                          <>
+                            {hasCode ? <RenderedContent content={msg.content} /> : msg.content}
+                            {deliverableFiles && deliverableFiles.length > 0 && taskId && (
+                              <DeliverableDownloadButton tenantId={tid} taskId={taskId} fileCount={deliverableFiles.length} />
+                            )}
+                          </>
+                        );
+                      })()}
                     </div>
                   </div>
                 </div>

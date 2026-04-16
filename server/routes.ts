@@ -9,8 +9,9 @@ import { sql } from "drizzle-orm";
 import { setupTenantSseRoute } from "./tenantEvents";
 import { auditAndInvalidate, invalidateTenant, invalidateTenantsList } from "./realtimeSideEffects";
 import { getEffectiveDefinitionSkills } from "./skillsRuntime";
-import { hermesRunOnce } from "./hermesAdapter";
-import { collaborationAfterUserMessage, openclawRunOnce } from "./openclawAdapter";
+import { collaborationAfterUserMessage } from "./openclawAdapter";
+import { dispatchAgentRun } from "./dispatchAgentRun";
+import { listDeliverables, createDeliverableZip, processAgentDeliverable } from "./deliverables";
 import { buildAgentSystemPrompt } from "./agentPrompts";
 import {
   getLlmServerStatus,
@@ -19,6 +20,12 @@ import {
   resolveOllamaBaseUrl,
   sanitizeOllamaProbeUrl,
 } from "./llmClient";
+import {
+  getTenantOllamaApiKey,
+  upsertTenantOllamaApiKey,
+  getTenantOpenRouterApiKey,
+  upsertTenantOpenRouterApiKey,
+} from "./tenantSecrets";
 import {
   insertTenantSchema, insertAgentSchema, insertTeamSchema,
   insertTeamMemberSchema, insertTaskSchema, insertMessageSchema,
@@ -41,8 +48,17 @@ import {
 } from "./agentConfiguration";
 import { ensureAgentRunsTables, getAgentRun, getRunEvents, listAgentRuns } from "./agentRuns";
 import { ensureAgentBudgetTables, getAgentBudgetSettings, updateAgentBudgetSettings } from "./agentBudgets";
-import { ensureCeoControlTable, getCeoControlMode, setCeoControlMode } from "./ceoControl";
+import {
+  ensureCeoControlTable,
+  getCeoControlMode,
+  setCeoControlMode,
+  setCeoEnabled,
+  getCeoControlSettings,
+} from "./ceoControl";
 import { createDefaultCeoForTenant } from "./ceoBootstrap";
+import { maybeDelegateCeoIncomingTask, maybeAutoCloseParentCeoTask } from "./ceoDelegation";
+
+// dispatchAgentRun imported from ./dispatchAgentRun
 
 const patchTenantSchema = insertTenantSchema.partial();
 
@@ -106,7 +122,8 @@ export async function registerRoutes(httpServer: Server, app: Express) {
     const rawQ = typeof req.query.url === "string" ? req.query.url : null;
     const override = sanitizeOllamaProbeUrl(rawQ);
     const base = override ?? resolveOllamaBaseUrl(tenant.ollamaBaseUrl);
-    const result = await listOllamaModels(base);
+    const secret = getTenantOllamaApiKey(tenantId);
+    const result = await listOllamaModels(base, { apiKey: secret.apiKey });
     if (!result.ok) {
       throw new ApiError(502, "ollama_list_failed", result.error);
     }
@@ -114,10 +131,120 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
   console.log("[express] Registered GET /api/tenants/:tenantId/ollama/models (Ollama model list)");
 
+  /** Probe an arbitrary Ollama base URL without needing an org yet (used by onboarding wizard). */
+  app.get("/api/ollama/models", async (req, res) => {
+    const rawQ = typeof req.query.url === "string" ? req.query.url : null;
+    const override = sanitizeOllamaProbeUrl(rawQ);
+    if (!override) throw new ApiError(400, "validation_error", "url required");
+    const result = await listOllamaModels(override, { apiKey: null });
+    if (!result.ok) {
+      throw new ApiError(502, "ollama_list_failed", result.error);
+    }
+    res.json({ baseUsed: result.baseUsed, models: result.models });
+  });
+  console.log("[express] Registered GET /api/ollama/models (Ollama probe)");
+
+  // ─── Ollama Cloud API Key (per-tenant, stored server-side) ────────────────
+  app.get("/api/tenants/:tenantId/ollama/api-key", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    if (!storage.getTenant(tenantId)) throw new ApiError(404, "not_found", "Tenant not found");
+    const s = getTenantOllamaApiKey(tenantId);
+    res.json({ configured: !!s.apiKey, updatedAt: s.updatedAt });
+  });
+
+  app.put("/api/tenants/:tenantId/ollama/api-key", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    if (!storage.getTenant(tenantId)) throw new ApiError(404, "not_found", "Tenant not found");
+    const apiKey = String(req.body?.apiKey ?? "").trim();
+    if (!apiKey || apiKey.length < 10 || apiKey.length > 4000) {
+      throw new ApiError(400, "validation_error", "Invalid apiKey");
+    }
+    const saved = upsertTenantOllamaApiKey(tenantId, apiKey);
+    auditAndInvalidate(tenantId, ["audit"], {
+      action: "ollama_api_key_saved",
+      entity: "tenant_secret",
+      entityId: String(tenantId),
+      detail: "Saved Ollama API key (stored server-side)",
+      tokensUsed: 0,
+      cost: 0,
+    });
+    res.json({ ok: true, configured: saved.configured, updatedAt: saved.updatedAt });
+  });
+
+  app.delete("/api/tenants/:tenantId/ollama/api-key", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    if (!storage.getTenant(tenantId)) throw new ApiError(404, "not_found", "Tenant not found");
+    const saved = upsertTenantOllamaApiKey(tenantId, null);
+    auditAndInvalidate(tenantId, ["audit"], {
+      action: "ollama_api_key_cleared",
+      entity: "tenant_secret",
+      entityId: String(tenantId),
+      detail: "Cleared Ollama API key",
+      tokensUsed: 0,
+      cost: 0,
+    });
+    res.json({ ok: true, configured: saved.configured, updatedAt: saved.updatedAt });
+  });
+
+  // ─── OpenRouter API Key (per-tenant, stored server-side) ──────────────────
+  app.get("/api/tenants/:tenantId/openrouter/api-key", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    if (!storage.getTenant(tenantId)) throw new ApiError(404, "not_found", "Tenant not found");
+    const s = getTenantOpenRouterApiKey(tenantId);
+    res.json({ configured: !!s.apiKey, updatedAt: s.updatedAt });
+  });
+
+  app.put("/api/tenants/:tenantId/openrouter/api-key", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    if (!storage.getTenant(tenantId)) throw new ApiError(404, "not_found", "Tenant not found");
+    const apiKey = String(req.body?.apiKey ?? "").trim();
+    if (!apiKey || apiKey.length < 10 || apiKey.length > 4000) {
+      throw new ApiError(400, "validation_error", "Invalid apiKey");
+    }
+    const saved = upsertTenantOpenRouterApiKey(tenantId, apiKey);
+    auditAndInvalidate(tenantId, ["audit"], {
+      action: "openrouter_api_key_saved",
+      entity: "tenant_secret",
+      entityId: String(tenantId),
+      detail: "Saved OpenRouter API key (stored server-side)",
+      tokensUsed: 0,
+      cost: 0,
+    });
+    res.json({ ok: true, configured: saved.configured, updatedAt: saved.updatedAt });
+  });
+
+  app.delete("/api/tenants/:tenantId/openrouter/api-key", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    if (!storage.getTenant(tenantId)) throw new ApiError(404, "not_found", "Tenant not found");
+    const saved = upsertTenantOpenRouterApiKey(tenantId, null);
+    auditAndInvalidate(tenantId, ["audit"], {
+      action: "openrouter_api_key_cleared",
+      entity: "tenant_secret",
+      entityId: String(tenantId),
+      detail: "Cleared OpenRouter API key",
+      tokensUsed: 0,
+      cost: 0,
+    });
+    res.json({ ok: true, configured: saved.configured, updatedAt: saved.updatedAt });
+  });
+
   app.post("/api/tenants", (req, res) => {
     const parsed = insertTenantSchema.safeParse(req.body);
     if (!parsed.success) throw new ApiError(400, "validation_error", "Invalid request", zodDetails(parsed.error));
-    const t = storage.createTenant(parsed.data);
+    const { ceoLlmProvider, ceoModel, useCeoAgent, ...tenantData } = parsed.data as any;
+    let t: any;
+    try {
+      t = storage.createTenant(tenantData);
+    } catch (e: any) {
+      const msg = String(e?.message ?? "");
+      const code = String(e?.code ?? "");
+      if (code === "SQLITE_CONSTRAINT_UNIQUE" || msg.includes("UNIQUE constraint failed: tenants.slug")) {
+        throw new ApiError(409, "slug_taken", "Organization slug is already in use. Choose a different name.", {
+          slug: tenantData?.slug,
+        });
+      }
+      throw e;
+    }
     auditAndInvalidate(t.id, ["tenant"], {
       action: "org_created",
       entity: "tenant",
@@ -127,16 +254,78 @@ export async function registerRoutes(httpServer: Server, app: Express) {
       cost: 0,
     });
 
-    // Every org gets a CEO agent + default instruction files (catalog is ensured inside).
-    try {
-      createDefaultCeoForTenant(t.id, t.name);
-    } catch (e: any) {
-      throw new ApiError(
-        500,
-        "ceo_bootstrap_failed",
-        "Organization was created but default CEO setup failed. Restart the server to repair, or delete this org and try again.",
-        { cause: String(e?.message ?? e) },
-      );
+    // Be tolerant: some clients may send booleans as strings.
+    const rawUseCeo = (req.body as any)?.useCeoAgent;
+    const normalizedUseCeo =
+      rawUseCeo === false || rawUseCeo === "false" || rawUseCeo === 0 || rawUseCeo === "0"
+        ? false
+        : rawUseCeo === true || rawUseCeo === "true" || rawUseCeo === 1 || rawUseCeo === "1"
+          ? true
+          : useCeoAgent;
+    const ceoEnabled = normalizedUseCeo !== false;
+    setCeoEnabled(t.id, ceoEnabled);
+    if (ceoEnabled) {
+      // Map the org adapter to per-agent adapter type + CLI command
+      const orgAdapter = String(t.adapterType ?? "hermes");
+      const cliAdapterMap: Record<string, { adapterType: "hermes" | "openclaw" | "cli"; command: string }> = {
+        hermes: { adapterType: "hermes", command: "" },
+        "claude-code": { adapterType: "cli", command: "claude" },
+        codex: { adapterType: "cli", command: "codex" },
+        "gemini-cli": { adapterType: "cli", command: "gemini" },
+        opencode: { adapterType: "cli", command: "opencode" },
+        cursor: { adapterType: "cli", command: "cursor" },
+        openclaw: { adapterType: "openclaw", command: "" },
+      };
+      const mapped = cliAdapterMap[orgAdapter] ?? { adapterType: "hermes" as const, command: "" };
+
+      try {
+        createDefaultCeoForTenant(t.id, t.name, {
+          llmProvider: ceoLlmProvider,
+          model: ceoModel,
+          adapterType: mapped.adapterType,
+          command: mapped.command,
+        });
+      } catch (e: any) {
+        throw new ApiError(
+          500,
+          "ceo_bootstrap_failed",
+          "Organization was created but default CEO setup failed. Restart the server to repair, or delete this org and try again.",
+          { cause: String(e?.message ?? e) },
+        );
+      }
+    } else {
+      // Safety net: ensure no CEO agent exists if disabled (handles legacy rows or partial failures).
+      try {
+        const existing = storage.getAgents(t.id);
+        for (const a of existing) {
+          if (String(a.role).toLowerCase() === "ceo") {
+            storage.deleteAgent(a.id);
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    // If CEO is disabled, also sanitize the starter task template to avoid "CEO" wording.
+    // (This keeps the UX consistent even if the client sent an older description.)
+    if (!ceoEnabled) {
+      try {
+        const tasks = storage.getTasks(t.id);
+        for (const task of tasks) {
+          if (!task?.description) continue;
+          const desc = String(task.description);
+          const next = desc
+            .replace(/\bYou are the CEO\b[^\n]*\n?/gi, "")
+            .replace(/\bCEO\b/gi, "")
+            .trim();
+          if (next !== desc) {
+            storage.updateTask(task.id, { description: next } as any);
+          }
+        }
+      } catch {
+        // ignore
+      }
     }
 
     invalidateTenantsList();
@@ -390,6 +579,24 @@ export async function registerRoutes(httpServer: Server, app: Express) {
 
   // ─── Agent Definitions ────────────────────────────────────────────────────
   app.get("/api/agent-definitions", (req, res) => res.json(storage.getAgentDefinitions()));
+
+  app.post("/api/agent-definitions", (req, res) => {
+    const body = req.body ?? {};
+    const name = String(body.name ?? "").trim();
+    if (!name) throw new ApiError(400, "validation_error", "name is required");
+    const data = {
+      name,
+      emoji: String(body.emoji ?? "🤖").trim(),
+      division: String(body.division ?? "Custom").trim(),
+      specialty: String(body.specialty ?? "").trim(),
+      description: String(body.description ?? "").trim(),
+      whenToUse: String(body.whenToUse ?? "").trim(),
+      source: "custom" as const,
+      color: String(body.color ?? "#6366f1").trim(),
+    };
+    const def = storage.createAgentDefinition(data);
+    res.status(201).json(def);
+  });
   app.get("/api/agent-definitions/division/:division", (req, res) =>
     res.json(storage.getAgentDefinitionsByDivision(req.params.division))
   );
@@ -428,6 +635,16 @@ export async function registerRoutes(httpServer: Server, app: Express) {
 
     const effective = await getEffectiveDefinitionSkills(tenantId, def.id);
     res.json(effective);
+  });
+
+  app.get("/api/agent-definitions/:id/docs", async (req, res) => {
+    const id = Number(req.params.id);
+    const def = storage.getAgentDefinition(id);
+    if (!def) throw new ApiError(404, "not_found", "Agent definition not found");
+    const { getAgentDocs } = await import("./skillsRuntime");
+    const docs = await getAgentDocs(id);
+    if (!docs) throw new ApiError(404, "not_found", "Agent docs not found");
+    res.json(docs);
   });
 
   app.put("/api/tenants/:tenantId/agent-definitions/:definitionId/skills", (req, res) => {
@@ -485,37 +702,18 @@ export async function registerRoutes(httpServer: Server, app: Express) {
     const tenantRow = storage.getTenant(tenantId);
     if (!tenantRow) throw new ApiError(404, "not_found", "Tenant not found");
 
-    if (tenantRow.adapterType === "openclaw") {
-      const result = await openclawRunOnce(tenantId, agentId, { reason: "manual" });
-      if (!result.ok) {
-        throw new ApiError(400, "cannot_run", `OpenClaw run failed: ${result.error}`);
-      }
-      auditAndInvalidate(tenantId, ["agents", "tasks", "messages", "goals"], {
-        agentId,
-        agentName: storage.getAgent(agentId)?.displayName ?? undefined,
-        action: "openclaw_run_once",
-        entity: "agent",
-        entityId: String(agentId),
-        detail: "OpenClaw run recorded in Cortex (gateway executes externally)",
-        tokensUsed: 0,
-        cost: 0,
-      });
-      res.json(result);
-      return;
-    }
-
-    const result = await hermesRunOnce(tenantId, agentId, { reason: "manual" });
+    const result = await dispatchAgentRun(tenantId, agentId, { reason: "manual" });
     if (!result.ok) {
-      throw new ApiError(400, "cannot_run", `Hermes run failed: ${result.reason}`);
+      throw new ApiError(400, "cannot_run", `Run failed (${result.adapter}): ${result.reason ?? result.error ?? "unknown"}`);
     }
     auditAndInvalidate(tenantId, ["agents", "tasks", "messages", "goals"], {
       agentId,
       agentName: storage.getAgent(agentId)?.displayName ?? undefined,
-      action: "hermes_run_once",
+      action: `${result.adapter}_run_once`,
       entity: "agent",
       entityId: String(agentId),
-      detail: `Hermes executed work using skills source: ${result.skillsSource}`,
-      tokensUsed: result.tokensUsed,
+      detail: `Run completed via ${result.adapter} adapter`,
+      tokensUsed: result.tokensUsed ?? 0,
       cost: result.costUsd ?? 0,
     });
     res.json(result);
@@ -542,11 +740,42 @@ export async function registerRoutes(httpServer: Server, app: Express) {
     const hireBody: Record<string, unknown> = { ...(req.body as object), tenantId };
     const llmProvider = normalizeLlmRouting(hireBody.llmProvider);
     delete hireBody.llmProvider;
+    const rawAdapterType = String(hireBody.adapterType ?? "hermes").toLowerCase();
+    delete hireBody.adapterType;
+    const rawCommand = String(hireBody.command ?? "").trim();
+    delete hireBody.command;
+    const rawModel = String(hireBody.runtimeModel ?? "").trim();
+    delete hireBody.runtimeModel;
+    const rawThinkingEffort = String(hireBody.thinkingEffort ?? "auto");
+    delete hireBody.thinkingEffort;
+    const rawExtraArgs = String(hireBody.extraArgs ?? "");
+    delete hireBody.extraArgs;
+    const rawHeartbeatEnabled = hireBody.heartbeatEnabled !== undefined ? !!hireBody.heartbeatEnabled : true;
+    delete hireBody.heartbeatEnabled;
+
     const parsed = insertAgentSchema.safeParse(hireBody);
     if (!parsed.success) throw new ApiError(400, "validation_error", "Invalid request", zodDetails(parsed.error));
+
+    // Auto-assign to CEO if no manager specified
+    if (!parsed.data.managerId) {
+      const existing = storage.getAgents(tenantId);
+      const ceo = existing.find((a) => a.role === "CEO");
+      if (ceo) parsed.data.managerId = ceo.id;
+    }
+
     const agent = storage.createAgent(parsed.data);
     ensureAgentConfigurationTables();
-    upsertAgentRuntimeSettings(agent.id, { llmProvider });
+
+    const adapterType = (["hermes", "openclaw", "cli"].includes(rawAdapterType) ? rawAdapterType : "hermes") as any;
+    upsertAgentRuntimeSettings(agent.id, {
+      llmProvider,
+      adapterType,
+      command: rawCommand,
+      model: rawModel,
+      thinkingEffort: (["auto", "low", "medium", "high"].includes(rawThinkingEffort) ? rawThinkingEffort : "auto") as any,
+      extraArgs: rawExtraArgs,
+      heartbeatEnabled: rawHeartbeatEnabled,
+    });
     auditAndInvalidate(tenantId, ["agents"], {
       agentId: agent.id,
       agentName: agent.displayName,
@@ -557,6 +786,15 @@ export async function registerRoutes(httpServer: Server, app: Express) {
       tokensUsed: 0,
       cost: 0,
     });
+    if (String(agent.status) === "running") {
+      void (async () => {
+        try {
+          await dispatchAgentRun(tenantId, agent.id, { reason: "start" });
+        } catch {
+          // ignore
+        }
+      })();
+    }
     res.json(agent);
   });
 
@@ -654,7 +892,12 @@ export async function registerRoutes(httpServer: Server, app: Express) {
     const runtime = getAgentRuntimeSettings(agentId);
 
     const modelId = (runtime.model || "").trim() || agent.model;
-    const llm = getLlmServerStatus(runtime.llmProvider, modelId, tenant.ollamaBaseUrl);
+    const tenantKey = getTenantOllamaApiKey(tenantId);
+    const tenantOrKey = getTenantOpenRouterApiKey(tenantId);
+    const llm = getLlmServerStatus(runtime.llmProvider, modelId, tenant.ollamaBaseUrl, {
+      ollamaApiKeyConfigured: !!tenantKey.apiKey,
+      openRouterApiKeyConfigured: !!tenantOrKey.apiKey,
+    });
 
     let result: any = {
       ok: true,
@@ -662,18 +905,9 @@ export async function registerRoutes(httpServer: Server, app: Express) {
       runtime,
       llm,
     };
-    if (tenant.adapterType === "hermes") {
-      // Use manual so it exercises the run path and writes audit/messages.
-      const run = await hermesRunOnce(tenantId, agentId, { reason: "manual" });
-      result = { ...result, hermes: run };
-      if (!run.ok) result.ok = false;
-    } else {
-      result = {
-        ...result,
-        ok: true,
-        note: "Openclaw selected. Gateway connectivity is not validated yet in AgentOS.",
-      };
-    }
+    const run = await dispatchAgentRun(tenantId, agentId, { reason: "manual" });
+    result = { ...result, run };
+    if (!run.ok) result.ok = false;
 
     auditAndInvalidate(tenantId, ["audit", "agents", "messages", "tasks", "goals"], {
       agentId,
@@ -781,14 +1015,33 @@ export async function registerRoutes(httpServer: Server, app: Express) {
     const tenantId = Number(req.params.tenantId);
     if (!storage.getTenant(tenantId)) throw new ApiError(404, "not_found", "Tenant not found");
     ensureCeoControlTable();
-    res.json({ tenantId, mode: getCeoControlMode(tenantId) });
+    const s = getCeoControlSettings(tenantId);
+    res.json({ tenantId, enabled: s.enabled, mode: s.mode, updatedAt: s.updatedAt });
   });
 
   app.put("/api/tenants/:tenantId/ceo/control", (req, res) => {
     const tenantId = Number(req.params.tenantId);
     if (!storage.getTenant(tenantId)) throw new ApiError(404, "not_found", "Tenant not found");
-    const mode = String(req.body?.mode ?? "agent") === "me" ? "me" : "agent";
     ensureCeoControlTable();
+    const requestedEnabled = req.body?.enabled;
+    const enabled = typeof requestedEnabled === "boolean" ? requestedEnabled : undefined;
+    const mode = String(req.body?.mode ?? getCeoControlMode(tenantId)) === "me" ? "me" : "agent";
+
+    if (enabled === false) {
+      setCeoEnabled(tenantId, false);
+      // Safety: delete any CEO agent rows if disabling.
+      try {
+        const agents = storage.getAgents(tenantId);
+        for (const a of agents) {
+          if (String(a.role).toLowerCase() === "ceo") storage.deleteAgent(a.id);
+        }
+      } catch {
+        // ignore
+      }
+    } else if (enabled === true) {
+      setCeoEnabled(tenantId, true);
+    }
+
     const saved = setCeoControlMode(tenantId, mode);
 
     // Side effects: if CEO is "me", pause/disable automated runs; if "agent", re-enable.
@@ -807,7 +1060,14 @@ export async function registerRoutes(httpServer: Server, app: Express) {
       action: "ceo_control_updated",
       entity: "ceo_control",
       entityId: String(tenantId),
-      detail: mode === "me" ? "CEO is now controlled by you" : "CEO returned to agent control",
+      detail:
+        enabled === false
+          ? "CEO disabled"
+          : enabled === true
+            ? "CEO enabled"
+            : mode === "me"
+              ? "CEO is now controlled by you"
+              : "CEO returned to agent control",
       tokensUsed: 0,
       cost: 0,
       agentId: ceo?.id ?? null,
@@ -837,27 +1097,15 @@ export async function registerRoutes(httpServer: Server, app: Express) {
       cost: 0,
     });
 
-    // If user starts an agent under Hermes, run one quick loop using effective skills.md.
     const becameRunning = req.body?.status === "running" && prev?.status !== "running";
-    const tenant = storage.getTenant(a.tenantId);
-    if (becameRunning && tenant?.adapterType === "hermes") {
-      try {
-        const result = await hermesRunOnce(a.tenantId, a.id, { reason: "start" });
-        if (result.ok) {
-          auditAndInvalidate(a.tenantId, ["agents", "tasks", "messages", "goals"], {
-            agentId: a.id,
-            agentName: a.displayName,
-            action: "hermes_run_once",
-            entity: "agent",
-            entityId: String(a.id),
-            detail: `Hermes executed work using skills source: ${result.skillsSource}`,
-            tokensUsed: result.tokensUsed,
-            cost: 0,
-          });
+    if (becameRunning) {
+      void (async () => {
+        try {
+          await dispatchAgentRun(a.tenantId, a.id, { reason: "start" });
+        } catch {
+          // don't block status updates if the run fails
         }
-      } catch {
-        // don't block status updates if the run fails
-      }
+      })();
     }
     res.json(a);
   });
@@ -865,9 +1113,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
     const id = Number(req.params.id);
     const agent = storage.getAgent(id);
     if (!agent) throw new ApiError(404, "not_found", "Agent not found");
-    if (String(agent.role).toLowerCase() === "ceo") {
-      throw new ApiError(403, "cannot_delete_ceo", "The CEO agent cannot be deleted.");
-    }
+    const isCeo = String(agent.role).toLowerCase() === "ceo";
     auditAndInvalidate(agent.tenantId, ["agents", "teams"], {
       agentId: agent.id,
       agentName: agent.displayName,
@@ -879,6 +1125,10 @@ export async function registerRoutes(httpServer: Server, app: Express) {
       cost: 0,
     });
     storage.deleteAgent(id);
+    if (isCeo) {
+      // If CEO is deleted, mark CEO disabled so bootstrap repair won't recreate it.
+      setCeoEnabled(agent.tenantId, false);
+    }
     res.json({ ok: true });
   });
 
@@ -1017,6 +1267,16 @@ export async function registerRoutes(httpServer: Server, app: Express) {
       tokensUsed: 0,
       cost: 0,
     });
+    const delegated = maybeDelegateCeoIncomingTask(task.id);
+    if (!delegated && task.assignedAgentId) {
+      void (async () => {
+        try {
+          await dispatchAgentRun(task.tenantId, task.assignedAgentId!, { reason: "start", bypassCooldown: true });
+        } catch {
+          // best-effort
+        }
+      })();
+    }
     res.json(task);
   });
   app.patch("/api/tasks/:id", (req, res) => {
@@ -1049,6 +1309,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
         tokensUsed: t.actualTokens ?? 0,
         cost: 0,
       });
+      maybeAutoCloseParentCeoTask(t);
     } else if (prev && t.status === "in_progress" && prev.status !== "in_progress") {
       auditAndInvalidate(t.tenantId, ["tasks", "goals"], {
         agentId: t.assignedAgentId ?? undefined,
@@ -1061,6 +1322,21 @@ export async function registerRoutes(httpServer: Server, app: Express) {
       });
     } else if (!statusChanged) {
       invalidateTenant(t.tenantId, ["tasks", "goals"]);
+    }
+
+    const assigneeChanged = !!prev && prev.assignedAgentId !== t.assignedAgentId;
+    let delegatedByPatch = false;
+    if (assigneeChanged || (!prev && t.assignedAgentId)) {
+      delegatedByPatch = maybeDelegateCeoIncomingTask(t.id);
+    }
+    if (assigneeChanged && t.assignedAgentId && !delegatedByPatch) {
+      void (async () => {
+        try {
+          await dispatchAgentRun(t.tenantId, t.assignedAgentId!, { reason: "start", bypassCooldown: true });
+        } catch {
+          // best-effort
+        }
+      })();
     }
     res.json(t);
   });
@@ -1079,6 +1355,53 @@ export async function registerRoutes(httpServer: Server, app: Express) {
     });
     storage.deleteTask(id);
     res.json({ ok: true });
+  });
+
+  // ─── Deliverables ────────────────────────────────────────────────────────
+  app.get("/api/tenants/:tenantId/tasks/:taskId/deliverables", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const taskId = Number(req.params.taskId);
+    const task = storage.getTask(taskId);
+    if (!task || task.tenantId !== tenantId) throw new ApiError(404, "not_found", "Task not found");
+    const items = listDeliverables(tenantId, taskId);
+    res.json({ taskId, hasFiles: items.length > 0, items });
+  });
+
+  app.get("/api/tenants/:tenantId/tasks/:taskId/deliverables/download", async (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const taskId = Number(req.params.taskId);
+    const task = storage.getTask(taskId);
+    if (!task || task.tenantId !== tenantId) throw new ApiError(404, "not_found", "Task not found");
+
+    const zip = await createDeliverableZip(tenantId, taskId, task.title);
+    if (!zip) throw new ApiError(404, "no_deliverables", "No deliverable files found");
+
+    const safeName = task.title.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 60) || `task-${taskId}`;
+    res.set("Content-Type", "application/zip");
+    res.set("Content-Disposition", `attachment; filename="${safeName}.zip"`);
+    res.set("Content-Length", String(zip.length));
+    res.send(zip);
+  });
+
+  app.post("/api/tenants/:tenantId/tasks/:taskId/deliverables/reprocess", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const taskId = Number(req.params.taskId);
+    const task = storage.getTask(taskId);
+    if (!task || task.tenantId !== tenantId) throw new ApiError(404, "not_found", "Task not found");
+
+    const allMessages = storage.getMessages(tenantId, "general");
+    let totalFiles = 0;
+    for (const msg of allMessages) {
+      if (!msg.senderAgentId || !msg.content.includes("```")) continue;
+      const meta = typeof msg.metadata === "string" ? JSON.parse(msg.metadata || "{}") : (msg.metadata ?? {});
+      const msgTaskId = meta.taskId ?? taskId;
+      if (msgTaskId !== taskId && !task.parentTaskId) continue;
+      const agent = storage.getAgent(msg.senderAgentId);
+      if (!agent) continue;
+      const files = processAgentDeliverable(tenantId, msgTaskId, agent.displayName, msg.content);
+      totalFiles += files.length;
+    }
+    res.json({ ok: true, taskId, filesExtracted: totalFiles });
   });
 
   // ─── Messages ─────────────────────────────────────────────────────────────

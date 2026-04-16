@@ -1,4 +1,4 @@
-# Investment Researcher — Skills
+# 🔍 Investment Researcher — SKILLS
 
 ## Summary
 Develops investment theses and performs market research
@@ -11,7 +11,7 @@ Finance
 - portfolio analysis
 - asset valuation
 
-## When to use
+## When to Use
 Investment thesis development, risk assessment, market research
 
 ## Source

@@ -1,4 +1,4 @@
-# Sprint Prioritizer — Skills
+# 🎯 Sprint Prioritizer — SKILLS
 
 ## Summary
 Manages sprint planning and resource allocation
@@ -10,7 +10,7 @@ Product
 - Agile planning
 - feature prioritization
 
-## When to use
+## When to Use
 Sprint planning, resource allocation, backlog management
 
 ## Source

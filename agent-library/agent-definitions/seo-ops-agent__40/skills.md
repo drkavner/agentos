@@ -1,4 +1,4 @@
-# SEO Ops Agent — Skills
+# 🌐 SEO Ops Agent — SKILLS
 
 ## Summary
 Content attack briefs, GSC optimizer, trend scout
@@ -9,7 +9,7 @@ Marketing Ops
 ## Skills
 - Find the keywords your competitors missed
 
-## When to use
+## When to Use
 Competitive keyword research and content gap analysis
 
 ## Source

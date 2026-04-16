@@ -1,4 +1,4 @@
-# Account Strategist — Skills
+# 🗺️ Account Strategist — SKILLS
 
 ## Summary
 Drives post-sale expansion and NRR growth
@@ -11,7 +11,7 @@ Sales
 - QBRs
 - stakeholder mapping
 
-## When to use
+## When to Use
 Post-sale expansion, account planning, NRR growth
 
 ## Source

@@ -1,4 +1,4 @@
-# Database Optimizer — Skills
+# 🗄️ Database Optimizer — SKILLS
 
 ## Summary
 Tunes PostgreSQL/MySQL, debugs slow queries, plans migrations
@@ -11,7 +11,7 @@ Engineering
 - query optimization
 - indexing strategies
 
-## When to use
+## When to Use
 Query optimization, slow query debugging, migration planning
 
 ## Source

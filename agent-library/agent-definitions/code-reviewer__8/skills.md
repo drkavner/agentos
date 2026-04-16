@@ -1,4 +1,4 @@
-# Code Reviewer — Skills
+# 👁️ Code Reviewer — SKILLS
 
 ## Summary
 Reviews PRs and maintains code quality standards
@@ -11,7 +11,7 @@ Engineering
 - security
 - maintainability
 
-## When to use
+## When to Use
 PR reviews, code quality gates, mentoring through review
 
 ## Source

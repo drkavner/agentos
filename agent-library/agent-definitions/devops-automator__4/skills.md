@@ -1,4 +1,4 @@
-# DevOps Automator — Skills
+# 🚀 DevOps Automator — SKILLS
 
 ## Summary
 Builds pipelines and manages deployment automation
@@ -11,7 +11,7 @@ Engineering
 - infrastructure automation
 - cloud ops
 
-## When to use
+## When to Use
 Pipeline development, deployment automation, monitoring
 
 ## Source

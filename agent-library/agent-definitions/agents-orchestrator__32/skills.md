@@ -1,4 +1,4 @@
-# Agents Orchestrator — Skills
+# 🎭 Agents Orchestrator — SKILLS
 
 ## Summary
 Coordinates complex projects requiring multiple agents
@@ -10,7 +10,7 @@ Specialized
 - Multi-agent coordination
 - workflow management
 
-## When to use
+## When to Use
 Complex projects requiring multiple agent coordination
 
 ## Source

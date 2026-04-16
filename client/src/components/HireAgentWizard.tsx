@@ -17,16 +17,12 @@ import {
 } from "@/components/ui/select";
 import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
-import { Check, ChevronRight, Bot, Cpu, Target, Users, DollarSign, Globe } from "lucide-react";
+import { Check, ChevronRight, Bot, Cpu, Target, Users, DollarSign, Globe, Terminal } from "lucide-react";
+import { AdapterIcon } from "./AdapterIcons";
+import { OPENROUTER_MODELS } from "@/lib/openrouterModels";
+import { Switch } from "@/components/ui/switch";
 
-const MODELS = [
-  { id: "claude-opus-4", label: "Claude Opus 4", desc: "Most capable, best reasoning", cost: "~$0.015/1k tokens" },
-  { id: "claude-3-5-sonnet", label: "Claude 3.5 Sonnet", desc: "Fast, smart, balanced", cost: "~$0.003/1k tokens" },
-  { id: "gpt-4o", label: "GPT-4o", desc: "OpenAI flagship", cost: "~$0.005/1k tokens" },
-  { id: "gpt-4o-mini", label: "GPT-4o Mini", desc: "Fast, cheap", cost: "~$0.00015/1k tokens" },
-  { id: "gemini-2.0-flash", label: "Gemini 2.0 Flash", desc: "Google, very fast", cost: "~$0.0001/1k tokens" },
-  { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", desc: "Google's best", cost: "~$0.007/1k tokens" },
-];
+const MODELS = OPENROUTER_MODELS;
 
 // Radix Select does not support empty-string item values; using a sentinel avoids a runtime crash when the "Assign Team" step mounts.
 const NO_MANAGER_VALUE = "__no_manager__";
@@ -76,6 +72,21 @@ export function HireAgentWizard({ open, onClose, preselectedDef }: HireAgentWiza
   const [heartbeat, setHeartbeat] = useState("*/30 * * * *");
   const [teamId, setTeamId] = useState<string>("");
   const [managerId, setManagerId] = useState<string>(NO_MANAGER_VALUE);
+  const [quantity, setQuantity] = useState(1);
+
+  // Per-agent adapter override
+  const [agentAdapter, setAgentAdapter] = useState<TenantAdapterType>("hermes");
+  const [command, setCommand] = useState("");
+
+  const ADAPTER_CMD_MAP: Record<string, { backend: string; cmd: string }> = {
+    hermes: { backend: "hermes", cmd: "" },
+    "claude-code": { backend: "cli", cmd: "claude" },
+    codex: { backend: "cli", cmd: "codex" },
+    "gemini-cli": { backend: "cli", cmd: "gemini" },
+    opencode: { backend: "cli", cmd: "opencode" },
+    cursor: { backend: "cli", cmd: "cursor" },
+    openclaw: { backend: "openclaw", cmd: "" },
+  };
 
   const { data: defs = [] } = useQuery<AgentDefinition[]>({
     queryKey: ["/api/agent-definitions"],
@@ -110,6 +121,26 @@ export function HireAgentWizard({ open, onClose, preselectedDef }: HireAgentWiza
     retry: false,
   });
 
+  // Sync adapter from tenant on load
+  useEffect(() => {
+    if (!tenant) return;
+    const tAdapter = tenant.adapterType as TenantAdapterType;
+    if (tAdapter && TENANT_ADAPTER_LABELS[tAdapter]) {
+      setAgentAdapter(tAdapter);
+      const mapped = ADAPTER_CMD_MAP[tAdapter];
+      if (mapped) setCommand(mapped.cmd);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tenant?.adapterType]);
+
+  // Auto-default manager to CEO so new hires appear in the org tree
+  useEffect(() => {
+    if (managerId !== NO_MANAGER_VALUE) return;
+    const ceo = agents.find((a: any) => a.role === "CEO" || (!a.managerId && agents.length > 1));
+    if (ceo) setManagerId(String(ceo.id));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agents]);
+
   useEffect(() => {
     if (llmProvider !== "ollama") return;
     const list = ollamaModelsRes?.models;
@@ -132,9 +163,7 @@ export function HireAgentWizard({ open, onClose, preselectedDef }: HireAgentWiza
       return res.json();
     },
     onSuccess: async (newAgent) => {
-      if (teamId) {
-        await apiRequest("POST", `/api/teams/${teamId}/members`, { agentId: newAgent.id });
-      }
+      if (teamId) await apiRequest("POST", `/api/teams/${teamId}/members`, { agentId: newAgent.id });
       queryClient.invalidateQueries({ queryKey: ["/api/tenants", tid, "agents"] });
       queryClient.invalidateQueries({ queryKey: ["/api/tenants", tid, "teams"] });
       toast({ title: `${displayName} hired!`, description: `${role} is ready to start working.` });
@@ -158,6 +187,10 @@ export function HireAgentWizard({ open, onClose, preselectedDef }: HireAgentWiza
     setStep(0); setSelectedDef(null); setDisplayName(""); setRole("");
     setGoal(""); setModel("claude-3-5-sonnet"); setLlmProvider("openrouter"); setMonthlyBudget(100);
     setHeartbeat("*/30 * * * *"); setTeamId(""); setManagerId(NO_MANAGER_VALUE); setSearchTerm("");
+    setQuantity(1);
+    const tAdapter = (tenant?.adapterType ?? "hermes") as TenantAdapterType;
+    setAgentAdapter(tAdapter);
+    setCommand(ADAPTER_CMD_MAP[tAdapter]?.cmd ?? "");
   }
 
   function selectDef(def: AgentDefinition) {
@@ -181,19 +214,42 @@ export function HireAgentWizard({ open, onClose, preselectedDef }: HireAgentWiza
   const modelReviewCost =
     llmProvider === "openrouter" ? (MODELS.find((m) => m.id === model)?.cost ?? "") : "Local · $0";
 
-  function handleHire() {
-    hire.mutate({
-      definitionId: selectedDef!.id,
-      displayName,
-      role,
-      goal,
-      model,
-      llmProvider,
-      monthlyBudget,
-      heartbeatSchedule: heartbeat,
-      managerId: managerId && managerId !== NO_MANAGER_VALUE ? Number(managerId) : null,
-      status: "idle",
+  async function handleHireMany() {
+    const created: any[] = [];
+    for (let i = 0; i < Math.max(1, Math.min(2, quantity)); i++) {
+      const suffix = i === 0 ? "" : ` ${i + 1}`;
+      const mapped = ADAPTER_CMD_MAP[agentAdapter] ?? { backend: "hermes", cmd: "" };
+      const payload = {
+        definitionId: selectedDef!.id,
+        displayName: `${displayName}${suffix}`.trim(),
+        role,
+        goal,
+        model,
+        llmProvider,
+        adapterType: mapped.backend,
+        command: command || mapped.cmd,
+        runtimeModel: model,
+        monthlyBudget,
+        heartbeatSchedule: heartbeat,
+        managerId: managerId && managerId !== NO_MANAGER_VALUE ? Number(managerId) : null,
+        status: "running",
+      };
+      // eslint-disable-next-line no-await-in-loop
+      const a = await hire.mutateAsync(payload);
+      created.push(a);
+      if (teamId) {
+        // eslint-disable-next-line no-await-in-loop
+        await apiRequest("POST", `/api/teams/${teamId}/members`, { agentId: a.id });
+      }
+    }
+    queryClient.invalidateQueries({ queryKey: ["/api/tenants", tid, "agents"] });
+    queryClient.invalidateQueries({ queryKey: ["/api/tenants", tid, "teams"] });
+    toast({
+      title: `Hired ${created.length} agent${created.length === 1 ? "" : "s"}`,
+      description: "They are ready to start working.",
     });
+    onClose();
+    resetForm();
   }
 
   return (
@@ -208,9 +264,8 @@ export function HireAgentWizard({ open, onClose, preselectedDef }: HireAgentWiza
             <p className="text-xs text-muted-foreground pt-1">
               Execution adapter:{" "}
               <span className="text-foreground font-medium">
-                {TENANT_ADAPTER_LABELS[(tenant.adapterType === "openclaw" ? "openclaw" : "hermes") as TenantAdapterType]}
+                {TENANT_ADAPTER_LABELS[agentAdapter] ?? agentAdapter}
               </span>
-              {" "}(all library hires for this org)
             </p>
           )}
         </DialogHeader>
@@ -303,6 +358,36 @@ export function HireAgentWizard({ open, onClose, preselectedDef }: HireAgentWiza
                 <button onClick={() => setStep(0)} className="ml-auto text-xs text-primary hover:underline">Change</button>
               </div>
 
+              {/* Adapter picker */}
+              <div className="space-y-2">
+                <Label className="text-xs">Adapter</Label>
+                <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
+                  {(Object.entries(TENANT_ADAPTER_LABELS) as [TenantAdapterType, string][]).map(([id, label]) => {
+                    const active = agentAdapter === id;
+                    return (
+                      <button
+                        key={id}
+                        type="button"
+                        onClick={() => {
+                          setAgentAdapter(id);
+                          const mapped = ADAPTER_CMD_MAP[id];
+                          if (mapped) setCommand(mapped.cmd);
+                        }}
+                        className={cn(
+                          "flex flex-col items-center gap-1 p-2.5 rounded-lg border text-center transition-all text-xs",
+                          active
+                            ? "border-primary bg-primary/10 text-foreground"
+                            : "border-border bg-card text-muted-foreground hover:border-primary/40 hover:bg-primary/5",
+                        )}
+                      >
+                        <AdapterIcon adapter={id} className="w-4 h-4" />
+                        <span className="font-medium leading-tight">{label}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
               <div className="space-y-3">
                 <div>
                   <Label className="text-xs">Display Name <span className="text-muted-foreground">(what to call this agent)</span></Label>
@@ -323,6 +408,21 @@ export function HireAgentWizard({ open, onClose, preselectedDef }: HireAgentWiza
                     onChange={e => setRole(e.target.value)}
                     data-testid="wizard-role"
                   />
+                </div>
+                <div>
+                  <Label className="text-xs">Quantity</Label>
+                  <Select value={String(quantity)} onValueChange={(v) => setQuantity(v === "2" ? 2 : 1)}>
+                    <SelectTrigger className="mt-1">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="1">1</SelectItem>
+                      <SelectItem value="2">2 (double)</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <div className="text-[11px] text-muted-foreground mt-1">
+                    If you pick 2, we’ll hire two copies (names get a “2” suffix).
+                  </div>
                 </div>
                 <div>
                   <Label className="text-xs">Goal <span className="text-muted-foreground">(what should this agent achieve?)</span></Label>
@@ -551,6 +651,7 @@ export function HireAgentWizard({ open, onClose, preselectedDef }: HireAgentWiza
                 </div>
                 <div className="p-4 space-y-3">
                   {[
+                    { icon: Terminal, label: "Adapter", value: TENANT_ADAPTER_LABELS[agentAdapter] ?? agentAdapter },
                     { icon: Target, label: "Goal", value: goal || "No goal set" },
                     {
                       icon: Globe,
@@ -568,6 +669,7 @@ export function HireAgentWizard({ open, onClose, preselectedDef }: HireAgentWiza
                           : `${modelReviewLabel} · ${modelReviewCost}`,
                     },
                     { icon: DollarSign, label: "Budget", value: `$${monthlyBudget}/month` },
+                    { icon: Bot, label: "Quantity", value: String(quantity) },
                     { icon: Bot, label: "Heartbeat", value: HEARTBEATS.find(h => h.value === heartbeat)?.label ?? heartbeat },
                     { icon: Users, label: "Team", value: teams.find(t => String(t.id) === teamId)?.name ?? "Independent" },
                     { icon: Users, label: "Reports to", value: agents.find((a: any) => String(a.id) === managerId)?.displayName ?? "Top-level" },
@@ -586,13 +688,13 @@ export function HireAgentWizard({ open, onClose, preselectedDef }: HireAgentWiza
                 <span>Agent slots used after hire</span>
                 <span className={cn(
                   "font-semibold tabular-nums",
-                  agents.length + 1 >= (tenant?.maxAgents ?? 25) ? "text-orange-400" : "text-foreground"
+                  agents.length + quantity >= (tenant?.maxAgents ?? 25) ? "text-orange-400" : "text-foreground"
                 )}>
-                  {agents.length + 1} / {tenant?.maxAgents ?? 25}
+                  {agents.length + quantity} / {tenant?.maxAgents ?? 25}
                 </span>
               </div>
               <p className="text-xs text-muted-foreground">
-                The agent will start in <strong>idle</strong> status. Hit "Start" on the My Agents page to activate it.
+                Hired agents start in <strong>running</strong> status so they can respond immediately.
               </p>
             </div>
           )}
@@ -624,11 +726,11 @@ export function HireAgentWizard({ open, onClose, preselectedDef }: HireAgentWiza
           ) : (
             <Button
               size="sm"
-              onClick={handleHire}
+              onClick={() => void handleHireMany()}
               disabled={hire.isPending}
               data-testid="wizard-hire"
             >
-              {hire.isPending ? "Hiring..." : `Hire ${displayName || "Agent"}`}
+              {hire.isPending ? "Hiring..." : `Hire ${quantity} ${displayName || "Agent"}${quantity === 1 ? "" : "s"}`}
             </Button>
           )}
         </div>

@@ -1,4 +1,4 @@
-# Product Manager — Skills
+# 🧭 Product Manager — SKILLS
 
 ## Summary
 Handles discovery, PRDs, roadmap planning, GTM, and outcome measurement
@@ -9,7 +9,7 @@ Product
 ## Skills
 - Full lifecycle product ownership
 
-## When to use
+## When to Use
 Discovery, PRDs, roadmap planning, GTM, outcome measurement
 
 ## Source

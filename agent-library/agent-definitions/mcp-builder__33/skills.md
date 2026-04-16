@@ -1,4 +1,4 @@
-# MCP Builder — Skills
+# 🔌 MCP Builder — SKILLS
 
 ## Summary
 Builds MCP servers that extend AI agent capabilities
@@ -10,7 +10,7 @@ Specialized
 - Model Context Protocol servers
 - AI agent tooling
 
-## When to use
+## When to Use
 Building MCP servers that extend AI agent capabilities
 
 ## Source

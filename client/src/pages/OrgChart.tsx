@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import type { Agent, AgentDefinition, Team, TeamMember } from "@shared/schema";
@@ -82,66 +82,107 @@ function mergeCanvasPositions(
 
 interface AgentNodeProps {
   agent: Agent;
-  def?: AgentDefinition;
-  reports: Agent[];
+  allAgents: Agent[];
   defs: AgentDefinition[];
   level: number;
 }
 
-function AgentNode({ agent, def, reports, defs, level }: AgentNodeProps) {
+const LEVEL_SIZES = [
+  { card: "w-52", avatar: "w-14 h-14 rounded-xl", avatarText: "text-3xl", dot: "w-4 h-4", nameText: "text-sm font-bold", pad: "p-4", gap: "gap-8", nodeW: 220 },
+  { card: "w-44", avatar: "w-11 h-11 rounded-xl", avatarText: "text-2xl", dot: "w-3 h-3", nameText: "text-xs font-semibold", pad: "p-3", gap: "gap-6", nodeW: 196 },
+  { card: "w-40", avatar: "w-9 h-9 rounded-lg", avatarText: "text-xl", dot: "w-2.5 h-2.5", nameText: "text-xs font-medium", pad: "p-2.5", gap: "gap-5", nodeW: 176 },
+  { card: "w-36", avatar: "w-8 h-8 rounded-lg", avatarText: "text-lg", dot: "w-2 h-2", nameText: "text-[11px] font-medium", pad: "p-2", gap: "gap-4", nodeW: 160 },
+];
+
+const LINE = "bg-muted-foreground/50";
+
+function AgentNode({ agent, allAgents, defs, level }: AgentNodeProps) {
+  const def = defs.find((d) => d.id === agent.definitionId);
+  const children = allAgents.filter((a) => a.managerId === agent.id);
+  const s = LEVEL_SIZES[Math.min(level, LEVEL_SIZES.length - 1)]!;
+
   return (
-    <div className={cn("flex flex-col items-center", level > 0 && "pt-6 relative")}>
-      {level > 0 && (
-        <div className="absolute top-0 left-1/2 -translate-x-1/2 w-px h-6 bg-border" />
-      )}
-      <div className={cn(
-        "relative border rounded-xl p-3 w-44 text-center cursor-pointer hover:border-primary/60 transition-all",
-        STATUS_COLORS[agent.status] ?? "border-border bg-card"
-      )} data-testid={`org-node-${agent.id}`}>
-        <div className="relative inline-block mb-2">
-          <div className="w-12 h-12 rounded-xl bg-primary/10 flex items-center justify-center text-2xl mx-auto">
+    <div className="flex flex-col items-center">
+      {/* Vertical line: horizontal bar → this node */}
+      {level > 0 && <div className={cn("w-0.5 h-8", LINE)} />}
+
+      {/* Card */}
+      <div
+        className={cn(
+          "relative border rounded-xl text-center cursor-pointer hover:border-primary/60 transition-all",
+          s.card, s.pad,
+          STATUS_COLORS[agent.status] ?? "border-border bg-card",
+        )}
+        data-testid={`org-node-${agent.id}`}
+      >
+        <div className="relative inline-block mb-1.5">
+          <div className={cn("bg-primary/10 flex items-center justify-center mx-auto", s.avatar, s.avatarText)}>
             {def?.emoji ?? "🤖"}
           </div>
-          <span className={cn("absolute -bottom-0.5 -right-0.5 w-3.5 h-3.5 rounded-full border-2 border-card", STATUS_DOT[agent.status] ?? "bg-muted")} />
+          <span className={cn("absolute -bottom-0.5 -right-0.5 rounded-full border-2 border-card", s.dot, STATUS_DOT[agent.status] ?? "bg-muted")} />
         </div>
-        <p className="text-xs font-semibold text-foreground">{agent.displayName}</p>
+        <p className={cn("text-foreground truncate", s.nameText)}>{agent.displayName}</p>
         <p className="text-xs text-muted-foreground truncate">{agent.role}</p>
-        <Badge variant="outline" className="mt-1.5 text-xs py-0">{agent.model.split("-").pop()}</Badge>
-        <div className="mt-2 flex justify-center gap-3 text-xs text-muted-foreground">
-          <span>✓ {agent.tasksCompleted}</span>
-          <span>$ {agent.spentThisMonth.toFixed(0)}</span>
-        </div>
+        {level < 2 && (
+          <>
+            {agent.goal && <p className="text-xs text-muted-foreground mt-0.5 truncate">{agent.goal}</p>}
+            <div className="mt-1.5 flex justify-center gap-3 text-xs text-muted-foreground">
+              <span>✓ {agent.tasksCompleted}</span>
+              <span>$ {agent.spentThisMonth.toFixed(0)}</span>
+            </div>
+          </>
+        )}
       </div>
 
-      {reports.length > 0 && (
-        <div className="relative mt-0 pt-6">
-          <div className="absolute top-6 left-1/2 -translate-x-1/2 w-px bg-border" style={{ height: "0" }} />
-          {/* Horizontal connector */}
-          <div className="relative flex gap-6 items-start">
-            {/* Connector bar */}
-            {reports.length > 1 && (
-              <div
-                className="absolute top-0 bg-border h-px"
-                style={{
-                  left: `calc(50% - (${reports.length} * 88px + (${reports.length - 1}) * 24px) / 2 + 88px / 2)`,
-                  width: `calc((${reports.length} - 1) * (176px + 24px))`,
-                }}
-              />
-            )}
-            {reports.map(r => (
-              <AgentNode
-                key={r.id}
-                agent={r}
-                def={defs.find(d => d.id === r.definitionId)}
-                reports={[]}
-                defs={defs}
-                level={level + 1}
-              />
-            ))}
-          </div>
-        </div>
+      {/* Children tree */}
+      {children.length > 0 && (
+        <ChildrenConnector line={LINE} gap={s.gap} count={children.length}>
+          {children.map((child) => (
+            <AgentNode key={child.id} agent={child} allAgents={allAgents} defs={defs} level={level + 1} />
+          ))}
+        </ChildrenConnector>
       )}
     </div>
+  );
+}
+
+function ChildrenConnector({ children, line, gap, count }: { children: React.ReactNode; line: string; gap: string; count: number }) {
+  const containerRef = useCallback((el: HTMLDivElement | null) => {
+    if (!el) return;
+    const cols = Array.from(el.children).filter(
+      (c) => c instanceof HTMLElement && c.getAttribute("data-child-col") !== null,
+    ) as HTMLElement[];
+    if (cols.length < 2) return;
+    const first = cols[0]!;
+    const last = cols[cols.length - 1]!;
+    const bar = el.querySelector<HTMLElement>("[data-h-bar]");
+    if (!bar) return;
+    const parentRect = el.getBoundingClientRect();
+    const l = first.getBoundingClientRect().left + first.getBoundingClientRect().width / 2 - parentRect.left;
+    const r = last.getBoundingClientRect().left + last.getBoundingClientRect().width / 2 - parentRect.left;
+    bar.style.left = `${l}px`;
+    bar.style.width = `${r - l}px`;
+    bar.style.display = "block";
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [count]);
+
+  return (
+    <>
+      {/* Vertical stem: parent card → horizontal bar */}
+      <div className={cn("w-0.5 h-8", line)} />
+
+      <div ref={containerRef} className={cn("relative flex items-start", gap)}>
+        {/* Horizontal bar spanning first-child-center to last-child-center */}
+        {count > 1 && (
+          <div data-h-bar="" className={cn("absolute top-0 h-0.5", line)} style={{ display: "none" }} />
+        )}
+        {React.Children.map(children, (child, i) => (
+          <div key={i} data-child-col="" className="flex flex-col items-center">
+            {child}
+          </div>
+        ))}
+      </div>
+    </>
   );
 }
 
@@ -206,8 +247,6 @@ export default function OrgChart() {
 
   // Build hierarchy
   const ceo = agents.find(a => !a.managerId);
-  const directReports = (mgr: Agent) => agents.filter(a => a.managerId === mgr.id);
-
   useEffect(() => {
     if (tid <= 0) return;
     try {
@@ -431,116 +470,25 @@ export default function OrgChart() {
           <div
             className="relative isolate h-[min(78vh,880px)] w-full min-w-0 max-w-full overflow-auto overscroll-contain rounded-b-lg border-t border-border bg-muted/10 [contain:layout]"
           >
-            {ceo ? (
+            {agents.length > 0 ? (
               <div className="flex w-full min-w-0 justify-center p-6 pb-10 box-border">
                 <div
                   className="inline-block origin-top will-change-transform"
                   style={{ transform: `scale(${orgChartZoom})`, transformOrigin: "top center" }}
                 >
-            <div className="flex flex-col items-center py-4" style={{ minWidth: "max-content" }}>
-              {/* CEO */}
-              <div className={cn(
-                "border rounded-xl p-4 w-52 text-center cursor-pointer hover:border-primary/60 transition-all",
-                STATUS_COLORS[ceo.status] ?? "border-border bg-card"
-              )} data-testid={`org-node-${ceo.id}`}>
-                <div className="relative inline-block mb-2">
-                  <div className="w-14 h-14 rounded-xl bg-primary/15 flex items-center justify-center text-3xl mx-auto">
-                    {defs.find(d => d.id === ceo.definitionId)?.emoji ?? "🤖"}
+                  <div className="py-4 flex gap-8 items-start" style={{ minWidth: "max-content" }}>
+                    {(() => {
+                      const roots = agents.filter((a) => !a.managerId);
+                      if (roots.length === 0) {
+                        return agents.map((a) => (
+                          <AgentNode key={a.id} agent={a} allAgents={agents} defs={defs} level={0} />
+                        ));
+                      }
+                      return roots.map((root) => (
+                        <AgentNode key={root.id} agent={root} allAgents={agents} defs={defs} level={0} />
+                      ));
+                    })()}
                   </div>
-                  <span className={cn("absolute -bottom-0.5 -right-0.5 w-4 h-4 rounded-full border-2 border-card", STATUS_DOT[ceo.status] ?? "bg-muted")} />
-                </div>
-                <p className="text-sm font-bold text-foreground">{ceo.displayName}</p>
-                <p className="text-xs text-primary font-medium">{ceo.role}</p>
-                <p className="text-xs text-muted-foreground mt-0.5 truncate">{ceo.goal}</p>
-                <div className="mt-2 flex justify-center gap-3 text-xs text-muted-foreground">
-                  <span>✓ {ceo.tasksCompleted}</span>
-                  <span>$ {ceo.spentThisMonth.toFixed(0)}</span>
-                </div>
-              </div>
-
-              {/* L1 reports connector */}
-              {directReports(ceo).length > 0 && (
-                <div className="w-px h-8 bg-border" />
-              )}
-
-              {/* L1 direct reports */}
-              {directReports(ceo).length > 0 && (
-                <div className="relative">
-                  <div
-                    className="absolute top-0 h-px bg-border"
-                    style={{
-                      left: `calc(50% - ${(directReports(ceo).length * 220) / 2}px + 110px)`,
-                      width: `${(directReports(ceo).length - 1) * 220}px`,
-                    }}
-                  />
-                  <div className="flex gap-8">
-                    {directReports(ceo).map(l1 => {
-                      const l2 = directReports(l1);
-                      return (
-                        <div key={l1.id} className="flex flex-col items-center">
-                          <div className="w-px h-8 bg-border" />
-                          <div className={cn(
-                            "border rounded-xl p-3 w-44 text-center cursor-pointer hover:border-primary/60 transition-all",
-                            STATUS_COLORS[l1.status] ?? "border-border bg-card"
-                          )} data-testid={`org-node-${l1.id}`}>
-                            <div className="relative inline-block mb-1.5">
-                              <div className="w-11 h-11 rounded-xl bg-primary/10 flex items-center justify-center text-2xl mx-auto">
-                                {defs.find(d => d.id === l1.definitionId)?.emoji ?? "🤖"}
-                              </div>
-                              <span className={cn("absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full border-2 border-card", STATUS_DOT[l1.status] ?? "bg-muted")} />
-                            </div>
-                            <p className="text-xs font-semibold text-foreground">{l1.displayName}</p>
-                            <p className="text-xs text-muted-foreground">{l1.role.split(" ").slice(-2).join(" ")}</p>
-                            <div className="mt-1.5 flex justify-center gap-2 text-xs text-muted-foreground">
-                              <span>✓{l1.tasksCompleted}</span>
-                              <span>${l1.spentThisMonth.toFixed(0)}</span>
-                            </div>
-                          </div>
-
-                          {/* L2 */}
-                          {l2.length > 0 && (
-                            <div className="w-px h-8 bg-border" />
-                          )}
-                          {l2.length > 0 && (
-                            <div className="relative">
-                              {l2.length > 1 && (
-                                <div
-                                  className="absolute top-0 h-px bg-border"
-                                  style={{
-                                    left: `calc(50% - ${(l2.length * 196) / 2}px + 98px)`,
-                                    width: `${(l2.length - 1) * 196}px`,
-                                  }}
-                                />
-                              )}
-                              <div className="flex gap-6">
-                                {l2.map(l2a => (
-                                  <div key={l2a.id} className="flex flex-col items-center">
-                                    <div className="w-px h-8 bg-border" />
-                                    <div className={cn(
-                                      "border rounded-xl p-2.5 w-40 text-center hover:border-primary/50 transition-all",
-                                      STATUS_COLORS[l2a.status] ?? "border-border bg-card"
-                                    )} data-testid={`org-node-${l2a.id}`}>
-                                      <div className="relative inline-block mb-1">
-                                        <div className="w-9 h-9 rounded-lg bg-primary/10 flex items-center justify-center text-xl mx-auto">
-                                          {defs.find(d => d.id === l2a.definitionId)?.emoji ?? "🤖"}
-                                        </div>
-                                        <span className={cn("absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-card", STATUS_DOT[l2a.status] ?? "bg-muted")} />
-                                      </div>
-                                      <p className="text-xs font-medium text-foreground">{l2a.displayName}</p>
-                                      <p className="text-xs text-muted-foreground line-clamp-1">{l2a.role.split(" ").slice(-2).join(" ")}</p>
-                                    </div>
-                                  </div>
-                                ))}
-                              </div>
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-            </div>
                 </div>
               </div>
             ) : (

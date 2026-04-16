@@ -1,4 +1,4 @@
-# Legal Compliance Checker — Skills
+# ⚖️ Legal Compliance Checker — SKILLS
 
 ## Summary
 Guides organizations through compliance certification
@@ -11,7 +11,7 @@ Support
 - regulations
 - legal review
 
-## When to use
+## When to Use
 Legal compliance, regulatory requirements, risk management
 
 ## Source

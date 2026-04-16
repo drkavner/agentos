@@ -6,7 +6,8 @@ import { serveStatic } from "./static";
 import { createServer } from "http";
 import type { AddressInfo } from "net";
 import { db } from "./db";
-import { seedDatabase } from "./seed";
+import { sql } from "drizzle-orm";
+import { removeDemoTenantIfPresent, seedDatabase } from "./seed";
 import { ensureAgentDefinitionsCatalog } from "./agentDefinitionsCatalog";
 import { repairAllTenantsMissingCeo } from "./ceoBootstrap";
 import { isApiError, type ApiErrorResponse } from "./apiError";
@@ -72,15 +73,16 @@ app.use((req, res, next) => {
   // Ensure DB schema is up-to-date before anything touches tables.
   migrate(db, { migrationsFolder: path.join(process.cwd(), "migrations") });
 
+  // Safety: add parent_task_id if migration didn't run (e.g. existing DB).
+  try { db.run(sql`ALTER TABLE tasks ADD COLUMN parent_task_id INTEGER`); } catch { /* already exists */ }
+
   // Agent Library catalog must exist even when full demo seed is disabled (e.g. production).
   ensureAgentDefinitionsCatalog();
 
-  const shouldSeed =
-    process.env.SEED === "true" ||
-    (process.env.SEED !== "false" && process.env.NODE_ENV !== "production");
-  if (shouldSeed) {
-    seedDatabase();
-  }
+  // Demo seed is disabled by default. Opt-in only.
+  const shouldSeed = process.env.SEED === "true";
+  if (shouldSeed) seedDatabase();
+  else removeDemoTenantIfPresent();
 
   await registerRoutes(httpServer, app);
   repairAllTenantsMissingCeo();
@@ -134,8 +136,9 @@ app.use((req, res, next) => {
         process.env.NODE_ENV !== "production" &&
         attemptsLeft > 0
       ) {
-        startServer(port + 1, attemptsLeft - 1);
-        return;
+        // Dev should be predictable. If the requested port is taken, fail fast
+        // so we don't silently hop to a random port (confusing for users).
+        throw err;
       }
       throw err;
     });
@@ -147,5 +150,5 @@ app.use((req, res, next) => {
     });
   };
 
-  startServer(requestedPort, 20);
+  startServer(requestedPort, 0);
 })();

@@ -1,9 +1,17 @@
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
 import type { AuditLog as AuditLogRow } from "@shared/schema";
 import { useTenantContext } from "@/tenant/TenantContext";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { ScrollText, Bot, DollarSign } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -41,6 +49,8 @@ function actionColor(action: string) {
 export default function AuditLog() {
   const { activeTenantId } = useTenantContext();
   const tid = activeTenantId ?? 0;
+  const [selected, setSelected] = useState<AuditLogRow | null>(null);
+  const [open, setOpen] = useState(false);
 
   const { data: events = [], isLoading } = useQuery<AuditLogRow[]>({
     queryKey: ["/api/tenants", tid, "audit"],
@@ -127,8 +137,12 @@ export default function AuditLog() {
                   events.map((e) => (
                     <tr
                       key={e.id}
-                      className="border-b border-border last:border-0 hover:bg-muted/20 transition-colors"
+                      className="border-b border-border last:border-0 hover:bg-muted/20 transition-colors cursor-pointer"
                       data-testid={`audit-row-${e.id}`}
+                      onClick={() => {
+                        setSelected(e);
+                        setOpen(true);
+                      }}
                     >
                       <td className="px-4 py-2.5 text-muted-foreground font-mono whitespace-nowrap">{formatTime(e.createdAt)}</td>
                       <td className="px-4 py-2.5">
@@ -156,6 +170,63 @@ export default function AuditLog() {
           </div>
         </CardContent>
       </Card>
+
+      <Dialog
+        open={open}
+        onOpenChange={(v) => {
+          setOpen(v);
+          if (!v) setSelected(null);
+        }}
+      >
+        <DialogContent className="max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>Audit event</DialogTitle>
+            <DialogDescription className="font-mono text-xs">
+              {selected ? `#${selected.id} · ${selected.action} · ${selected.entity}` : "—"}
+            </DialogDescription>
+          </DialogHeader>
+
+          {!selected ? (
+            <div className="text-sm text-muted-foreground">No event selected.</div>
+          ) : (
+            <div className="space-y-3">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+                <div className="rounded-md border border-border bg-muted/20 p-3">
+                  <div className="text-muted-foreground mb-1">Time</div>
+                  <div className="font-mono">{selected.createdAt}</div>
+                </div>
+                <div className="rounded-md border border-border bg-muted/20 p-3">
+                  <div className="text-muted-foreground mb-1">Agent</div>
+                  <div className="font-mono">
+                    {selected.agentName ?? "—"}
+                    {selected.agentId ? ` (id=${selected.agentId})` : ""}
+                  </div>
+                </div>
+                <div className="rounded-md border border-border bg-muted/20 p-3">
+                  <div className="text-muted-foreground mb-1">Tokens / Cost</div>
+                  <div className="font-mono">
+                    {(selected.tokensUsed ?? 0).toLocaleString()} tokens · ${Number(selected.cost ?? 0).toFixed(6)}
+                  </div>
+                </div>
+                <div className="rounded-md border border-border bg-muted/20 p-3">
+                  <div className="text-muted-foreground mb-1">Entity</div>
+                  <div className="font-mono">
+                    {selected.entity}
+                    {selected.entityId ? ` (id=${selected.entityId})` : ""}
+                  </div>
+                </div>
+              </div>
+
+              <div className="rounded-md border border-border bg-muted/20 p-3">
+                <div className="text-muted-foreground text-xs mb-2">Detail (full)</div>
+                <pre className="text-xs whitespace-pre-wrap font-mono max-h-[420px] overflow-auto">
+{selected.detail ?? "—"}
+                </pre>
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

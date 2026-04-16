@@ -1,4 +1,4 @@
-# Pipeline Analyst — Skills
+# 📊 Pipeline Analyst — SKILLS
 
 ## Summary
 Manages pipeline reviews and forecasting accuracy
@@ -12,7 +12,7 @@ Sales
 - deal velocity
 - RevOps
 
-## When to use
+## When to Use
 Pipeline reviews, forecast accuracy, revenue operations
 
 ## Source

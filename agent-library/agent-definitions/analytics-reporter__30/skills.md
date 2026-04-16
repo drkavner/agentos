@@ -1,4 +1,4 @@
-# Analytics Reporter — Skills
+# 📊 Analytics Reporter — SKILLS
 
 ## Summary
 Builds business intelligence and tracks KPIs
@@ -11,7 +11,7 @@ Support
 - dashboards
 - insights
 
-## When to use
+## When to Use
 Business intelligence, KPI tracking, data visualization
 
 ## Source

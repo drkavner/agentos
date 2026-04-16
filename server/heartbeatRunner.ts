@@ -1,11 +1,13 @@
 import { db } from "./db";
-import { agents } from "@shared/schema";
-import { eq } from "drizzle-orm";
+import { agents, tasks } from "@shared/schema";
+import { eq, and, isNull, ne } from "drizzle-orm";
 import { storage } from "./storage";
 import { auditAndInvalidate } from "./realtimeSideEffects";
-import { hermesRunOnce } from "./hermesAdapter";
-import { ensureAgentConfigurationTables, getAgentRuntimeSettings } from "./agentConfiguration";
 import { pickAgentPrimaryChannel } from "./hermesAdapter";
+import { ensureAgentConfigurationTables, getAgentRuntimeSettings } from "./agentConfiguration";
+import { dispatchAgentRun } from "./dispatchAgentRun";
+import { getCeoControlSettings } from "./ceoControl";
+import { maybeDelegateCeoIncomingTask } from "./ceoDelegation";
 
 type ParsedSchedule =
   | { kind: "everyNMinutes"; n: number }
@@ -114,6 +116,12 @@ async function heartbeatTick() {
     const tenant = storage.getTenant(a.tenantId);
     if (!tenant) continue;
 
+    // If CEO is disabled for this org, do not run its scheduled heartbeats even if the agent row exists.
+    if (String(a.role).toLowerCase() === "ceo") {
+      const s = getCeoControlSettings(a.tenantId);
+      if (s.enabled === false) continue;
+    }
+
     // Allow per-agent runtime settings to disable scheduled heartbeats.
     ensureAgentConfigurationTables();
     const runtime = getAgentRuntimeSettings(a.id);
@@ -123,71 +131,87 @@ async function heartbeatTick() {
     const sched = parseSchedule(a.heartbeatSchedule);
     if (!dueNow(sched, now, last)) continue;
 
-    if (tenant.adapterType === "hermes") {
-      // Hermes: do real work loop (writes message/task/audit via existing plumbing)
-      try {
-        await hermesRunOnce(a.tenantId, a.id, { reason: "scheduled" });
-        // hermesRunOnce already updates lastHeartbeat; we still record a heartbeat audit for clarity.
-        auditAndInvalidate(a.tenantId, ["agents", "tasks", "messages", "goals"], {
-          agentId: a.id,
-          agentName: a.displayName,
-          action: "heartbeat",
-          entity: "agent",
-          entityId: String(a.id),
-          detail: `Scheduled heartbeat (${a.heartbeatSchedule})`,
-          tokensUsed: 0,
-          cost: 0,
-        });
-      } catch {
-        // ignore to keep runner stable
-      }
-    } else {
-      // OpenClaw: record the heartbeat tick (gateway would normally phone home)
-      const iso = now.toISOString();
-      storage.updateAgent(a.id, { lastHeartbeat: iso });
-      // Also emit a lightweight collaboration update so the UI doesn't feel one-way.
-      const def = storage.getAgentDefinition(a.definitionId);
-      const primary = pickAgentPrimaryChannel(a.tenantId, a.id, null);
-      const msg = storage.createMessage({
-        tenantId: a.tenantId,
-        channelId: primary.channelId,
-        channelType: primary.channelType,
-        senderAgentId: a.id,
-        senderName: `${a.displayName} (${a.role})`,
-        senderEmoji: def?.emoji ?? "🤖",
-        content: `Heartbeat ping (${a.heartbeatSchedule}) — OpenClaw org: awaiting gateway execution. Set a task + use Run for a recorded signal.`,
-        messageType: "heartbeat",
-        metadata: { openclawHeartbeat: true },
-      } as any);
-      auditAndInvalidate(a.tenantId, ["messages"], {
-        agentId: a.id,
-        agentName: a.displayName,
-        action: "message_sent",
-        entity: "message",
-        entityId: String(msg.id),
-        detail: msg.content.slice(0, 200),
-        tokensUsed: 0,
-        cost: 0,
-      });
-      auditAndInvalidate(a.tenantId, ["agents"], {
+    // Mark the tick immediately so we don't re-fire multiple times within the same
+    // minute window when a run fails before it can update lastHeartbeat.
+    const iso = now.toISOString();
+    storage.updateAgent(a.id, { lastHeartbeat: iso });
+
+    const adapterType = runtime.adapterType ?? (tenant.adapterType === "openclaw" ? "openclaw" : "hermes");
+
+    try {
+      await dispatchAgentRun(a.tenantId, a.id, { reason: "scheduled" });
+      auditAndInvalidate(a.tenantId, ["agents", "tasks", "messages", "goals"], {
         agentId: a.id,
         agentName: a.displayName,
         action: "heartbeat",
         entity: "agent",
         entityId: String(a.id),
-        detail: `Scheduled heartbeat (${a.heartbeatSchedule}) — awaiting OpenClaw gateway`,
+        detail: `Scheduled heartbeat (${a.heartbeatSchedule}) — adapter: ${adapterType}`,
         tokensUsed: 0,
         cost: 0,
       });
+    } catch {
+      // ignore to keep runner stable
+    }
+  }
+}
+
+async function workScanTick() {
+  const tenants = storage.getTenants();
+  for (const tenant of tenants) {
+    const unassigned = db
+      .select()
+      .from(tasks)
+      .where(and(eq(tasks.tenantId, tenant.id), isNull(tasks.assignedAgentId), ne(tasks.status, "done")))
+      .all();
+    if (unassigned.length === 0) continue;
+
+    const runningAgents = db
+      .select()
+      .from(agents)
+      .where(and(eq(agents.tenantId, tenant.id), eq(agents.status, "running")))
+      .all()
+      .filter((a) => String(a.role).toLowerCase() !== "ceo");
+    if (runningAgents.length === 0) continue;
+
+    for (const task of unassigned) {
+      const busyCounts = new Map<number, number>();
+      const allTasks = storage.getTasks(tenant.id);
+      for (const t of allTasks) {
+        if (t.status !== "done" && t.assignedAgentId) {
+          busyCounts.set(t.assignedAgentId, (busyCounts.get(t.assignedAgentId) ?? 0) + 1);
+        }
+      }
+      const leastBusy = runningAgents.sort(
+        (a, b) => (busyCounts.get(a.id) ?? 0) - (busyCounts.get(b.id) ?? 0),
+      )[0];
+      if (!leastBusy) continue;
+
+      storage.updateTask(task.id, { assignedAgentId: leastBusy.id } as any);
+      auditAndInvalidate(tenant.id, ["tasks"], {
+        agentId: leastBusy.id,
+        agentName: leastBusy.displayName,
+        action: "task_checkout",
+        entity: "task",
+        entityId: String(task.id),
+        detail: `Auto-assigned unassigned task: ${task.title}`,
+        tokensUsed: 0,
+        cost: 0,
+      });
+      break;
     }
   }
 }
 
 export function startHeartbeatRunner() {
-  // tick every second so minute-bound schedules are accurate
   const intervalMs = 1000;
   setInterval(() => {
     void heartbeatTick();
   }, intervalMs);
+
+  // Work scan: every 10s, auto-assign orphaned tasks to idle agents.
+  setInterval(() => {
+    void workScanTick();
+  }, 10_000);
 }
 

@@ -1,95 +1,20 @@
 import { cn } from "@/lib/utils";
 import type { TenantAdapterType } from "@shared/schema";
-
-/** Caduceus-style mark for Hermes (multi-provider local agent). */
-function HermesLogo({ className }: { className?: string }) {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      fill="none"
-      xmlns="http://www.w3.org/2000/svg"
-      className={cn("shrink-0", className)}
-      aria-hidden
-    >
-      <path
-        d="M12 3v18"
-        stroke="currentColor"
-        strokeWidth="1.75"
-        strokeLinecap="round"
-      />
-      <path
-        d="M12 6.5c-2.8 0-4.5 1.6-4.5 3.5 0 1.2.7 2.2 1.8 2.9M12 6.5c2.8 0 4.5 1.6 4.5 3.5 0 1.2-.7 2.2-1.8 2.9"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-      />
-      <path
-        d="M7.5 17.5c1.2-1.8 2.5-2.8 4.5-2.8s3.3 1 4.5 2.8"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-      />
-      <circle cx="9" cy="5" r="1.35" fill="currentColor" />
-      <circle cx="15" cy="5" r="1.35" fill="currentColor" />
-    </svg>
-  );
-}
-
-/** Robot / gateway terminal mark for OpenClaw. */
-function OpenClawLogo({ className }: { className?: string }) {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      fill="none"
-      xmlns="http://www.w3.org/2000/svg"
-      className={cn("shrink-0", className)}
-      aria-hidden
-    >
-      <rect
-        x="4.5"
-        y="6"
-        width="15"
-        height="12"
-        rx="2.5"
-        stroke="currentColor"
-        strokeWidth="1.75"
-      />
-      <path
-        d="M8 10h8M8 13.5h5"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-      />
-      <circle cx="9.5" cy="17" r="1" fill="currentColor" />
-      <circle cx="14.5" cy="17" r="1" fill="currentColor" />
-      <path
-        d="M10 4.5h4"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-      />
-    </svg>
-  );
-}
+import { AdapterIcon } from "./AdapterIcons";
 
 const OPTIONS: {
   value: TenantAdapterType;
   title: string;
   subtitle: string;
-  Logo: typeof HermesLogo;
+  recommended?: boolean;
 }[] = [
-  {
-    value: "hermes",
-    title: "Hermes Agent",
-    subtitle: "Local multi-provider agent",
-    Logo: HermesLogo,
-  },
-  {
-    value: "openclaw",
-    title: "OpenClaw Gateway",
-    subtitle: "Configure OpenClaw within the App",
-    Logo: OpenClawLogo,
-  },
+  { value: "hermes", title: "Hermes Agent", subtitle: "Local multi-provider agent" },
+  { value: "claude-code", title: "Claude Code", subtitle: "Local Claude agent" },
+  { value: "codex", title: "Codex", subtitle: "Local Codex agent" },
+  { value: "gemini-cli", title: "Gemini CLI", subtitle: "Local Gemini agent" },
+  { value: "opencode", title: "OpenCode", subtitle: "Local multi-provider agent" },
+  { value: "cursor", title: "Cursor", subtitle: "Local Cursor agent" },
+  { value: "openclaw", title: "OpenClaw Gateway", subtitle: "Invoke OpenClaw via gateway protocol" },
 ];
 
 type AdapterPickerCardsProps = {
@@ -110,8 +35,8 @@ export function AdapterPickerCards({
 }: AdapterPickerCardsProps) {
   return (
     <div className={cn("space-y-2", className)}>
-      <div className="grid grid-cols-2 gap-3" data-testid={testId}>
-        {OPTIONS.map(({ value: v, title, subtitle, Logo }) => {
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3" data-testid={testId}>
+        {OPTIONS.map(({ value: v, title, subtitle, recommended }) => {
           const selected = value === v;
           return (
             <button
@@ -119,7 +44,7 @@ export function AdapterPickerCards({
               type="button"
               onClick={() => onChange(v)}
               className={cn(
-                "flex flex-col items-center rounded-xl border-2 px-3 py-4 text-center transition-all outline-none",
+                "relative flex flex-col items-center rounded-xl border-2 px-3 py-4 text-center transition-all outline-none",
                 "focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background",
                 selected
                   ? "border-primary bg-muted/90 text-foreground shadow-sm ring-1 ring-primary/15"
@@ -128,12 +53,14 @@ export function AdapterPickerCards({
               data-testid={`adapter-card-${v}`}
               aria-pressed={selected}
             >
-              <Logo
-                className={cn(
-                  "mb-3 h-9 w-9",
-                  selected ? "text-foreground" : "text-muted-foreground",
-                )}
-              />
+              {recommended && (
+                <span className="absolute -top-2 right-2 bg-green-500 text-white text-[10px] font-medium px-1.5 py-0.5 rounded-full leading-none">
+                  Recommended
+                </span>
+              )}
+              <span className={cn("mb-3 h-9 w-9 shrink-0 flex items-center justify-center", selected ? "text-foreground" : "text-muted-foreground")}>
+                <AdapterIcon adapter={v} className="w-6 h-6" />
+              </span>
               <span
                 className={cn(
                   "text-sm font-semibold leading-tight",

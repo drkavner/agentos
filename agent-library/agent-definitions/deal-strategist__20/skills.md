@@ -1,4 +1,4 @@
-# Deal Strategist — Skills
+# ♟️ Deal Strategist — SKILLS
 
 ## Summary
 Scores deals, exposes pipeline risk, builds win strategies
@@ -11,7 +11,7 @@ Sales
 - competitive positioning
 - win planning
 
-## When to use
+## When to Use
 Scoring deals, exposing pipeline risk, building win strategies
 
 ## Source

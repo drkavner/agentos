@@ -4,6 +4,13 @@ import { eq } from "drizzle-orm";
 import { agentDefinitions, tenants, agents, teams, teamMembers, tasks, messages, goals, auditLog } from "@shared/schema";
 import { ensureAgentDefinitionsCatalog } from "./agentDefinitionsCatalog";
 
+export function removeDemoTenantIfPresent() {
+  const demo = db.select({ id: tenants.id }).from(tenants).where(eq(tenants.slug, "cerebratech")).get() as any;
+  if (!demo?.id) return false;
+  storage.deleteTenant(Number(demo.id));
+  return true;
+}
+
 export function seedDatabase() {
   ensureAgentDefinitionsCatalog();
   const demoExists = db.select().from(tenants).where(eq(tenants.slug, "cerebratech")).get();

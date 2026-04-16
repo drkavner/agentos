@@ -1,4 +1,4 @@
-# Recruitment Specialist — Skills
+# 🎯 Recruitment Specialist — SKILLS
 
 ## Summary
 Handles recruitment strategy, sourcing, and hiring
@@ -10,7 +10,7 @@ Specialized
 - Talent acquisition
 - recruiting operations
 
-## When to use
+## When to Use
 Recruitment strategy, sourcing, and hiring processes
 
 ## Source

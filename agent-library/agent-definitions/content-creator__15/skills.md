@@ -1,4 +1,4 @@
-# Content Creator — Skills
+# 📝 Content Creator — SKILLS
 
 ## Summary
 Builds content strategy and copywriting across channels
@@ -10,7 +10,7 @@ Marketing
 - Multi-platform content
 - editorial calendars
 
-## When to use
+## When to Use
 Content strategy, copywriting, brand storytelling
 
 ## Source

@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "wouter";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { apiRequest, queryClient } from "@/lib/queryClient";
@@ -46,10 +46,15 @@ export default function CeoDashboard() {
 
   const runEvents = useMemo(() => {
     if (!ceo) return [];
-    // We treat CEO "runs" as either Hermes manual runs or heartbeats for now.
+    // We treat CEO "runs" as hermes/openclaw runs, heartbeats, and explicit failures.
     return audit
       .filter((r) => r.agentId === ceo.id)
-      .filter((r) => r.action === "hermes_run_once" || r.action === "heartbeat")
+      .filter((r) =>
+        r.action === "hermes_run_once" ||
+        r.action === "openclaw_run_once" ||
+        r.action === "heartbeat" ||
+        r.action === "agent_run_failed"
+      )
       .slice()
       .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
   }, [audit, ceo]);
@@ -89,6 +94,18 @@ export default function CeoDashboard() {
     },
   });
 
+  // Auto-run once when opening the CEO dashboard so we immediately learn if the
+  // chosen provider/model is healthy. Real provider/API-key failures surface via Audit Log.
+  const [autoRan, setAutoRan] = useState(false);
+  useEffect(() => {
+    if (autoRan) return;
+    if (!ceo || tid <= 0) return;
+    if (runEvents.length > 0) return;
+    setAutoRan(true);
+    runOnce.mutate();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoRan, ceo?.id, tid, runEvents.length]);
+
   const budgetPct = activeTenant ? Math.min(1, activeTenant.spentThisMonth / Math.max(1, activeTenant.monthlyBudget)) : 0;
   return (
     <CeoShell>
@@ -108,10 +125,20 @@ export default function CeoDashboard() {
               <div className="flex items-center gap-2 text-xs text-muted-foreground">
                 <span className="inline-flex items-center gap-1.5">
                   <XCircle className="w-3.5 h-3.5 text-muted-foreground" />
-                  <Badge variant="outline" className="text-xs py-0">ok</Badge>
+                  <Badge
+                    variant="outline"
+                    className={cn(
+                      "text-xs py-0",
+                      latestRun.action === "agent_run_failed" && "border-destructive/40 text-destructive"
+                    )}
+                  >
+                    {latestRun.action === "agent_run_failed" ? "failed" : "ok"}
+                  </Badge>
                 </span>
                 <span className="font-mono">{latestRun.id}</span>
-                <Badge variant="outline" className="text-[10px] py-0">on-demand</Badge>
+                <Badge variant="outline" className="text-[10px] py-0">
+                  {latestRun.action === "heartbeat" ? "heartbeat" : "on-demand"}
+                </Badge>
                 <span className="ml-auto">{new Date(latestRun.createdAt).toLocaleString()}</span>
               </div>
               <div className="text-sm text-foreground">
@@ -121,14 +148,21 @@ export default function CeoDashboard() {
           ) : (
             <>
               <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                <XCircle className="w-3.5 h-3.5 text-destructive" />
-                <Badge variant="outline" className="text-xs py-0 border-destructive/40 text-destructive">failed</Badge>
+                <XCircle className="w-3.5 h-3.5 text-muted-foreground" />
+                <Badge variant="outline" className="text-xs py-0">—</Badge>
                 <span className="font-mono">—</span>
-                <Badge variant="outline" className="text-[10px] py-0">on-demand</Badge>
+                <Badge variant="outline" className="text-[10px] py-0">—</Badge>
                 <span className="ml-auto">—</span>
               </div>
               <div className="text-sm text-foreground">
-                No runs yet. Click <span className="font-medium">Run Heartbeat</span> or go to <span className="font-medium">Runs</span>.
+                {runOnce.isPending ? (
+                  <>Running first heartbeat…</>
+                ) : (
+                  <>
+                    No runs yet. A first heartbeat will run automatically. You can also run one manually or go to{" "}
+                    <span className="font-medium">Runs</span>.
+                  </>
+                )}
               </div>
               <div className="pt-2">
                 <Button size="sm" variant="outline" onClick={() => runOnce.mutate()} disabled={!ceo || runOnce.isPending}>

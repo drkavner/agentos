@@ -19,6 +19,7 @@ type AgentConfiguration = {
   profile: { title: string; capabilities: string };
   runtime: {
     llmProvider: "openrouter" | "ollama";
+    adapterType: "hermes" | "openclaw" | "cli";
     bypassSandbox: boolean;
     enableSearch: boolean;
     command: string;
@@ -320,6 +321,35 @@ export default function CeoConfiguration() {
                 <CardTitle className="text-sm">Permissions &amp; Configuration</CardTitle>
               </CardHeader>
               <CardContent className="space-y-4">
+                <div className="space-y-2 max-w-md">
+                  <div className="text-xs text-muted-foreground">Adapter type</div>
+                  <Select
+                    value={form.runtime.adapterType ?? "hermes"}
+                    onValueChange={(v) =>
+                      setForm((f) => {
+                        if (!f) return f;
+                        const next = { ...f, runtime: { ...f.runtime, adapterType: v as any } };
+                        updateConfigMutation.mutate({ runtime: { adapterType: v } as any });
+                        return next;
+                      })
+                    }
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="hermes">Hermes (internal sim/LLM)</SelectItem>
+                      <SelectItem value="cli">CLI (claude, codex, gemini, etc.)</SelectItem>
+                      <SelectItem value="openclaw">OpenClaw Gateway</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  {form.runtime.adapterType === "cli" && (
+                    <p className="text-[11px] text-amber-500">
+                      CLI adapter spawns the configured Command below. Make sure the CLI tool is installed and in PATH.
+                    </p>
+                  )}
+                </div>
+
                 <div className="space-y-2 max-w-md">
                   <div className="text-xs text-muted-foreground">LLM provider</div>
                   <Select

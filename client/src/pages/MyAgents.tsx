@@ -17,6 +17,7 @@ import {
   AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle
 } from "@/components/ui/alert-dialog";
 import { HireAgentWizard } from "@/components/HireAgentWizard";
+import { AddAgentDialog } from "@/components/AddAgentDialog";
 
 const STATUS_CONFIG: Record<string, { label: string; dot: string; badge: string }> = {
   running: { label: "Running", dot: "bg-green-500 status-running", badge: "bg-green-500/10 text-green-400 border-green-500/20" },
@@ -37,12 +38,26 @@ export default function MyAgents() {
   const { toast } = useToast();
   const [deleteId, setDeleteId] = useState<number | null>(null);
   const [wizardOpen, setWizardOpen] = useState(false);
+  const [addAgentOpen, setAddAgentOpen] = useState(false);
   const [detailsAgentId, setDetailsAgentId] = useState<number | null>(null);
+
+  const { data: ceoControl } = useQuery<{ enabled?: boolean; mode?: "agent" | "me" }>({
+    queryKey: ["/api/tenants", tid, "ceo", "control"],
+    queryFn: () => apiRequest("GET", `/api/tenants/${tid}/ceo/control`).then((r) => r.json()),
+    enabled: tid > 0,
+  });
 
   const { data: agents = [], isLoading } = useQuery<Agent[]>({
     queryKey: ["/api/tenants", tid, "agents"],
     queryFn: () => apiRequest("GET", `/api/tenants/${tid}/agents`).then(r => r.json()),
   });
+
+  const visibleAgents = useMemo(() => {
+    if (ceoControl?.enabled === false) {
+      return agents.filter((a) => String(a.role).toLowerCase() !== "ceo");
+    }
+    return agents;
+  }, [agents, ceoControl?.enabled]);
 
   const { data: defs = [] } = useQuery<AgentDefinition[]>({
     queryKey: ["/api/agent-definitions"],
@@ -55,8 +70,8 @@ export default function MyAgents() {
   });
 
   const selectedAgent = useMemo(
-    () => (detailsAgentId ? agents.find((a) => a.id === detailsAgentId) ?? null : null),
-    [agents, detailsAgentId],
+    () => (detailsAgentId ? visibleAgents.find((a) => a.id === detailsAgentId) ?? null : null),
+    [visibleAgents, detailsAgentId],
   );
   const selectedDef = useMemo(
     () => (selectedAgent ? defs.find((d) => d.id === selectedAgent.definitionId) ?? null : null),
@@ -102,8 +117,8 @@ export default function MyAgents() {
   });
 
   const maxAgents = tenant?.maxAgents ?? 25;
-  const atLimit = agents.length >= maxAgents;
-  const limitPct = Math.min(100, (agents.length / maxAgents) * 100);
+  const atLimit = visibleAgents.length >= maxAgents;
+  const limitPct = Math.min(100, (visibleAgents.length / maxAgents) * 100);
 
   const updateStatus = useMutation({
     mutationFn: ({ id, status }: { id: number; status: string }) =>
@@ -121,15 +136,17 @@ export default function MyAgents() {
     },
   });
 
-  const totalSpent = agents.reduce((s, a) => s + a.spentThisMonth, 0);
-  const totalCompleted = agents.reduce((s, a) => s + a.tasksCompleted, 0);
+  const totalSpent = visibleAgents.reduce((s, a) => s + a.spentThisMonth, 0);
+  const totalCompleted = visibleAgents.reduce((s, a) => s + a.tasksCompleted, 0);
 
   return (
     <div className="p-6 space-y-5 max-w-[1400px] mx-auto">
       <div className="flex items-start justify-between gap-4">
         <div className="flex-1 min-w-0">
           <h1 className="text-xl font-bold text-foreground">My Agents</h1>
-          <p className="text-sm text-muted-foreground mt-0.5">{agents.length} agents deployed · {agents.filter(a => a.status === "running").length} running</p>
+          <p className="text-sm text-muted-foreground mt-0.5">
+            {visibleAgents.length} agents deployed · {visibleAgents.filter(a => a.status === "running").length} running
+          </p>
           {/* Agent usage bar */}
           <div className="mt-2 flex items-center gap-3 max-w-xs">
             <Progress
@@ -137,7 +154,7 @@ export default function MyAgents() {
               className={cn("h-1.5 flex-1", atLimit ? "[&>div]:bg-destructive" : limitPct > 80 ? "[&>div]:bg-orange-400" : "")}
             />
             <span className={cn("text-xs font-medium tabular-nums shrink-0", atLimit ? "text-destructive" : "text-muted-foreground")}>
-              {agents.length} / {maxAgents}
+              {visibleAgents.length} / {maxAgents}
             </span>
           </div>
           {atLimit && (
@@ -146,20 +163,31 @@ export default function MyAgents() {
             </p>
           )}
         </div>
-        <Button
-          data-testid="hire-agent-btn"
-          onClick={() => setWizardOpen(true)}
-          disabled={atLimit}
-          title={atLimit ? `Limit of ${maxAgents} agents reached` : undefined}
-        >
-          <Plus className="w-4 h-4 mr-1.5" /> Hire Agent
-        </Button>
+        <div className="flex gap-2">
+          <Button
+            variant="outline"
+            data-testid="hire-agent-btn"
+            onClick={() => setWizardOpen(true)}
+            disabled={atLimit}
+            title={atLimit ? `Limit of ${maxAgents} agents reached` : undefined}
+          >
+            <Bot className="w-4 h-4 mr-1.5" /> Hire from Library
+          </Button>
+          <Button
+            data-testid="add-agent-btn"
+            onClick={() => setAddAgentOpen(true)}
+            disabled={atLimit}
+            title={atLimit ? `Limit of ${maxAgents} agents reached` : undefined}
+          >
+            <Plus className="w-4 h-4 mr-1.5" /> Add Agent
+          </Button>
+        </div>
       </div>
 
       {/* Summary row */}
       <div className="grid grid-cols-3 gap-4">
         {[
-          { icon: Bot, label: "Total Agents", value: agents.length, sub: `${agents.filter(a => a.status === "running").length} running` },
+          { icon: Bot, label: "Total Agents", value: visibleAgents.length, sub: `${visibleAgents.filter(a => a.status === "running").length} running` },
           { icon: CheckCircle, label: "Tasks Completed", value: totalCompleted, sub: "all time" },
           { icon: DollarSign, label: "Total Spent", value: `$${totalSpent.toFixed(2)}`, sub: "this month" },
         ].map(s => (
@@ -189,7 +217,7 @@ export default function MyAgents() {
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {agents.map(agent => {
+          {visibleAgents.map(agent => {
             const def = defs.find(d => d.id === agent.definitionId);
             const s = STATUS_CONFIG[agent.status] ?? STATUS_CONFIG.idle;
             const budgetPct = (agent.spentThisMonth / agent.monthlyBudget) * 100;
@@ -311,6 +339,7 @@ export default function MyAgents() {
       )}
 
       <HireAgentWizard open={wizardOpen} onClose={() => setWizardOpen(false)} />
+      <AddAgentDialog open={addAgentOpen} onClose={() => setAddAgentOpen(false)} />
 
       <Dialog open={detailsAgentId != null} onOpenChange={(o) => setDetailsAgentId(o ? detailsAgentId : null)}>
         <DialogContent className="max-w-4xl">

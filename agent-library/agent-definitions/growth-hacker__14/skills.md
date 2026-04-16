@@ -1,4 +1,4 @@
-# Growth Hacker — Skills
+# 🚀 Growth Hacker — SKILLS
 
 ## Summary
 Drives explosive growth through experiments and optimization
@@ -11,7 +11,7 @@ Marketing
 - viral loops
 - experiments
 
-## When to use
+## When to Use
 Explosive growth, user acquisition, conversion optimization
 
 ## Source

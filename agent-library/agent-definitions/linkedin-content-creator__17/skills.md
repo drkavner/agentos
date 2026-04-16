@@ -1,4 +1,4 @@
-# LinkedIn Content Creator — Skills
+# 💼 LinkedIn Content Creator — SKILLS
 
 ## Summary
 Grows LinkedIn presence and builds B2B content
@@ -11,7 +11,7 @@ Marketing
 - thought leadership
 - professional content
 
-## When to use
+## When to Use
 LinkedIn growth, professional audience building, B2B content
 
 ## Source

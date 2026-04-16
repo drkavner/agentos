@@ -1,11 +1,15 @@
 import { storage } from "./storage";
 import { db } from "./db";
-import { and, eq, isNull, ne, desc } from "drizzle-orm";
+import { and, eq, isNull, ne, desc, like } from "drizzle-orm";
 import { messages, tasks, teamMembers } from "@shared/schema";
+import { parentTaskMarker, maybeAutoCloseParentCeoTask } from "./ceoDelegation";
 import { getEffectiveDefinitionSkills } from "./skillsRuntime";
 import { buildAgentSystemPrompt } from "./agentPrompts";
 import { completeLlmChat, getOpenRouterApiKey, resolveOllamaBaseUrl } from "./llmClient";
 import { auditAndInvalidate, invalidateTenant } from "./realtimeSideEffects";
+import { getTenantOllamaApiKey, getTenantOpenRouterApiKey } from "./tenantSecrets";
+import { processAgentDeliverable } from "./deliverables";
+import { spawn } from "child_process";
 import {
   ensureAgentConfigurationTables,
   getAgentRuntimeSettings,
@@ -14,6 +18,42 @@ import {
   upsertAgentRuntimeSettings,
 } from "./agentConfiguration";
 import { addRunEvent, createAgentRun, finishAgentRun, type RunTrigger } from "./agentRuns";
+import { getAgentDocsSync } from "./skillsRuntime";
+
+async function completeViaHermesAgentCli(opts: {
+  provider: "openrouter" | "ollama";
+  model: string;
+  prompt: string;
+  timeoutMs: number;
+}): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
+  const args = ["chat", "--quiet", "--provider", opts.provider, "--model", opts.model, "--query", opts.prompt];
+  return await new Promise((resolve) => {
+    const child = spawn("hermes", args, { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    let err = "";
+    const to = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // ignore
+      }
+      resolve({ ok: false, error: `timeout after ${opts.timeoutMs}ms` });
+    }, Math.max(1000, opts.timeoutMs));
+
+    child.stdout.on("data", (b) => (out += String(b)));
+    child.stderr.on("data", (b) => (err += String(b)));
+    child.on("error", (e) => {
+      clearTimeout(to);
+      resolve({ ok: false, error: String((e as any)?.message ?? e) });
+    });
+    child.on("close", (code) => {
+      clearTimeout(to);
+      const text = out.trim();
+      if (code === 0 && text) return resolve({ ok: true, text });
+      resolve({ ok: false, error: (err || text || `exit ${code ?? "?"}`).trim().slice(0, 2000) });
+    });
+  });
+}
 
 function pickWorkTask(tenantId: number, agentId: number) {
   const assigned = db
@@ -33,9 +73,146 @@ function pickWorkTask(tenantId: number, agentId: number) {
   return unassigned;
 }
 
+function hasOpenCeoDelegatedChildren(tenantId: number, parentTaskId: number) {
+  const byField = db
+    .select({ id: tasks.id })
+    .from(tasks)
+    .where(
+      and(
+        eq(tasks.tenantId, tenantId),
+        eq(tasks.parentTaskId, parentTaskId),
+        ne(tasks.status, "done"),
+      ),
+    )
+    .get();
+  if (byField) return true;
+  const marker = `%${parentTaskMarker(parentTaskId)}%`;
+  return !!db
+    .select({ id: tasks.id })
+    .from(tasks)
+    .where(
+      and(
+        eq(tasks.tenantId, tenantId),
+        like(tasks.description, marker),
+        ne(tasks.status, "done"),
+      ),
+    )
+    .get();
+}
+
 function estimateTokensFromSkills(md: string) {
   const len = md.trim().length;
   return Math.max(120, Math.min(2400, Math.round(len / 6)));
+}
+
+function pick<T>(arr: T[]): T {
+  return arr[Math.floor(Math.random() * arr.length)]!;
+}
+
+function generateAutonomousSimMessage(
+  agent: { id: number; displayName: string; role: string; goal?: string | null; definitionId: number },
+  def: { name: string; specialty: string; description: string; division: string },
+  task: { id: number; title: string; description?: string | null } | undefined | null,
+  lastMsg: { senderName: string; senderAgentId: number | null; content: string } | undefined | null,
+  reason: string,
+  skillBullets: string[],
+): string {
+  const role = agent.role;
+  const specialty = def.specialty.split(",").map((s) => s.trim()).filter(Boolean);
+  const topSkill = specialty[0] ?? role;
+  const docs = getAgentDocsSync(agent.definitionId);
+  const soulIdentity = docs?.SOUL?.markdown?.match(/## Identity\n([\s\S]*?)(?=\n##|$)/)?.[1]?.trim() ?? "";
+  const soulPurpose = docs?.SOUL?.markdown?.match(/## Core Purpose\n([\s\S]*?)(?=\n##|$)/)?.[1]?.trim() ?? def.description;
+
+  const replyTo =
+    lastMsg && lastMsg.senderAgentId !== agent.id && lastMsg.senderAgentId != null
+      ? lastMsg
+      : null;
+
+  const parts: string[] = [];
+
+  if (replyTo) {
+    const replySnippet = String(replyTo.content).slice(0, 100);
+    parts.push(pick([
+      `@${replyTo.senderName} Got it, I'll incorporate that into my work.`,
+      `@${replyTo.senderName} Thanks for the update. Aligning my approach with yours.`,
+      `@${replyTo.senderName} Noted — "${replySnippet}${replyTo.content.length > 100 ? "..." : ""}". I'll factor this in.`,
+      `@${replyTo.senderName} Acknowledged. Coordinating on this.`,
+    ]));
+  }
+
+  if (task) {
+    const desc = String(task.description ?? "").slice(0, 200);
+    const purposeLine = soulPurpose || def.description;
+    const taskTemplates = [
+      [
+        `Working on "${task.title}" now.`,
+        soulIdentity ? `${soulIdentity.split(".")[0]}.` : null,
+        `I've analyzed the requirements and I'm breaking this into actionable steps.`,
+        `Current approach: leveraging my ${topSkill} capabilities to ${pick(["draft a plan", "build the first iteration", "run an analysis", "set up the framework", "research best practices"])}.`,
+        desc ? `Key context from the brief: "${desc.slice(0, 120)}..."` : null,
+        `I'll post deliverables once the first pass is ready.`,
+      ],
+      [
+        `Starting task #${task.id}: "${task.title}".`,
+        `As someone who ${purposeLine.toLowerCase()}, this is right in my wheelhouse.`,
+        `Phase 1: ${pick(["Research & discovery", "Requirements analysis", "Initial setup", "Competitive analysis", "Architecture design"])} — estimated ${pick(["15 min", "20 min", "30 min"])}.`,
+        `Phase 2: ${pick(["Execution & implementation", "Content creation", "Testing & validation", "Drafting deliverables"])}.`,
+        skillBullets.length > 0
+          ? `Applying: ${skillBullets.slice(0, 2).join(", ")}.`
+          : `My ${topSkill} expertise is directly relevant here.`,
+        `Will share progress updates as I hit milestones.`,
+      ],
+      [
+        `On it. "${task.title}" is my focus right now.`,
+        `I've reviewed the task details and ${pick(["identified 3 key areas to address", "mapped out the approach", "scoped the deliverables", "prioritized the critical path"])}.`,
+        desc ? `The brief mentions: "${desc.slice(0, 80)}..." — I'm using this as my north star.` : null,
+        `${pick(["Drafting", "Building", "Analyzing", "Researching", "Designing"])} the first deliverable now. ETA: ${pick(["~15 minutes", "~20 minutes", "shortly"])}.`,
+        `My core mission: ${purposeLine}. This task aligns perfectly.`,
+      ],
+      [
+        `Taking ownership of "${task.title}".`,
+        `As the ${role}, my approach: ${pick([
+          `run a thorough analysis and present findings`,
+          `create a structured plan with clear milestones`,
+          `build a working prototype and iterate`,
+          `synthesize the requirements into an actionable brief`,
+          `apply ${topSkill} best practices to deliver quality output`,
+        ])}.`,
+        `${pick(["Currently", "Right now I'm", "First step:"])} ${pick([
+          "gathering relevant data and reviewing existing materials",
+          "sketching the solution architecture",
+          "outlining the key deliverables and milestones",
+          "setting up the workspace and pulling dependencies",
+          "running a quick competitive scan for reference",
+        ])}.`,
+        `I'll coordinate with the team if I need input on any dependencies.`,
+      ],
+      [
+        `Picked up "${task.title}" — let's get this done.`,
+        desc ? `Context: "${desc.slice(0, 150)}..."` : null,
+        `Here's my execution plan:`,
+        `1. ${pick(["Audit current state", "Gather requirements", "Review prior work", "Map dependencies"])}`,
+        `2. ${pick(["Build first draft", "Create the framework", "Run initial analysis", "Prototype the solution"])}`,
+        `3. ${pick(["Test and validate", "Get peer feedback", "Iterate on v1", "Polish deliverables"])}`,
+        `Targeting completion within this work cycle. ${skillBullets.length > 0 ? `Key skills I'm applying: ${skillBullets.slice(0, 3).join(", ")}.` : ""}`,
+      ],
+    ];
+    const chosen = pick(taskTemplates);
+    parts.push(...chosen.filter(Boolean) as string[]);
+  } else {
+    const idleLine = soulPurpose
+      ? `While I wait, I'm reviewing opportunities related to: ${soulPurpose.slice(0, 100)}.`
+      : `Keeping an eye on the team's progress in case anyone needs ${topSkill} support.`;
+    parts.push(pick([
+      `Standing by — no tasks in my queue. ${idleLine}`,
+      `All caught up on tasks. Ready to take on new work whenever it comes in. ${idleLine}`,
+      `Queue is clear. I'm reviewing past outputs and looking for optimization opportunities.`,
+      `No pending tasks. ${idleLine}`,
+    ]));
+  }
+
+  return parts.join("\n\n");
 }
 
 export function pickAgentPrimaryChannel(
@@ -56,7 +233,12 @@ export function pickAgentPrimaryChannel(
 export async function hermesRunOnce(
   tenantId: number,
   agentId: number,
-  opts?: { reason?: "start" | "scheduled" | "manual" },
+  opts?: {
+    reason?: "start" | "scheduled" | "manual";
+    forceChannelId?: string;
+    forceChannelType?: "general" | "team" | "dm";
+    bypassCooldown?: boolean;
+  },
 ) {
   const agent = storage.getAgent(agentId);
   if (!agent || agent.tenantId !== tenantId) return { ok: false as const, reason: "agent_not_found" as const };
@@ -64,10 +246,8 @@ export async function hermesRunOnce(
   const tenant = storage.getTenant(tenantId);
   if (!tenant) return { ok: false as const, reason: "tenant_not_found" as const };
 
-  if (tenant.adapterType !== "hermes") {
-    return { ok: false as const, reason: "not_hermes" as const };
-  }
-
+  // Per-agent adapter override: if the agent is configured as hermes, run it
+  // regardless of the tenant's default adapter type.
   ensureAgentConfigurationTables();
   const runtime = getAgentRuntimeSettings(agentId);
   const nowDate = new Date();
@@ -77,7 +257,7 @@ export async function hermesRunOnce(
     reason === "scheduled" ? "timer" : reason === "start" ? "assignment" : "on_demand";
   const run = createAgentRun({ tenantId, agentId, trigger, startedAt: nowIso });
 
-  if (runtime.cooldownSec > 0 && runtime.lastRunAt) {
+  if (!opts?.bypassCooldown && runtime.cooldownSec > 0 && runtime.lastRunAt) {
     const last = new Date(runtime.lastRunAt);
     if (Number.isFinite(last.getTime())) {
       const since = (nowDate.getTime() - last.getTime()) / 1000;
@@ -113,7 +293,17 @@ export async function hermesRunOnce(
 
     addRunEvent(run.id, { kind: "event", message: `reason=${reason}; skillsSource=${skills.source}` });
 
-    const primary = pickAgentPrimaryChannel(tenantId, agentId, task?.teamId ?? null);
+    const primary =
+      opts?.forceChannelId
+        ? {
+            channelId: opts.forceChannelId,
+            channelType: (opts.forceChannelType ??
+              (opts.forceChannelId.startsWith("team-") ? "team" : opts.forceChannelId.startsWith("dm-") ? "dm" : "general")) as
+              | "general"
+              | "team"
+              | "dm",
+          }
+        : pickAgentPrimaryChannel(tenantId, agentId, task?.teamId ?? null);
     const dmTargetId = agent.managerId ?? null;
 
     const lastMsg = db
@@ -133,57 +323,131 @@ export async function hermesRunOnce(
 
     const modelId = (runtime.model || "").trim() || agent.model;
     const routing = runtime.llmProvider;
+    const openRouterKey = routing === "openrouter" ? getTenantOpenRouterApiKey(tenantId).apiKey : null;
     const canCallLlm =
-      routing === "ollama" || (routing === "openrouter" && !!getOpenRouterApiKey());
+      routing === "ollama" || (routing === "openrouter" && (!!openRouterKey || !!getOpenRouterApiKey()));
 
     let systemPrompt: string;
     try {
       systemPrompt = await buildAgentSystemPrompt(tenantId, agentId);
     } catch (e: any) {
       addRunEvent(run.id, { kind: "stderr", message: `system prompt failed: ${String(e?.message ?? e)}` });
+      auditAndInvalidate(tenantId, ["agents"], {
+        agentId,
+        agentName: `${agent.displayName} (${agent.role})`,
+        action: "agent_run_failed",
+        entity: "agent_run",
+        entityId: String(run.id),
+        detail: `prompt_error: ${String(e?.message ?? e).slice(0, 800)}`,
+        tokensUsed: 0,
+        cost: 0,
+      });
       finishAgentRun(run.id, { status: "failed", error: "prompt", summary: "Failed to build system prompt" });
       return { ok: false as const, reason: "prompt_error" as const };
     }
 
     let assistantBody: string;
     if (canCallLlm) {
-      const userPrompt = [
-        `Post an update to collaboration channel "${primary.channelId}" (${primary.channelType}).`,
-        `Run trigger: ${reason}.`,
-        task
-          ? `Active task: "${task.title}"\n${task.description ? `Description: ${String(task.description).slice(0, 1200)}` : ""}`
-          : "No queued task — explain what you're monitoring and what you'd pick up next.",
-        lastMsg
-          ? `Latest channel message from ${lastMsg.senderName}: ${String(lastMsg.content).slice(0, 600)}`
-          : "No prior messages in this channel.",
-        `Write the message body only: 2–8 sentences, plain text, specific to your role and skills.`,
-      ]
-        .filter(Boolean)
-        .join("\n\n");
+      const userPrompt = task
+        ? [
+            `You have been assigned a task. PRODUCE THE ACTUAL DELIVERABLE — not a status update.`,
+            `Task: "${task.title}"`,
+            task.description ? `Description: ${String(task.description).slice(0, 2000)}` : null,
+            ``,
+            `INSTRUCTIONS:`,
+            `- If the task asks for code, WRITE THE COMPLETE WORKING CODE with file names.`,
+            `- If the task asks for a document, WRITE THE FULL DOCUMENT.`,
+            `- If the task asks for a plan, WRITE A DETAILED PLAN with concrete steps.`,
+            `- Use markdown formatting. Use code blocks with language tags for code.`,
+            `- DO NOT just say "I will do X" or "I'm starting work on X". Actually DO the work and show the output.`,
+            `- Be thorough and produce production-quality output.`,
+            lastMsg
+              ? `\nContext — latest channel message from ${lastMsg.senderName}: ${String(lastMsg.content).slice(0, 600)}`
+              : null,
+          ]
+            .filter(Boolean)
+            .join("\n")
+        : [
+            `Post a brief status update to channel "${primary.channelId}".`,
+            `Run trigger: ${reason}.`,
+            `No queued task — explain what you're monitoring and what you'd pick up next.`,
+            lastMsg
+              ? `Latest channel message from ${lastMsg.senderName}: ${String(lastMsg.content).slice(0, 600)}`
+              : "No prior messages in this channel.",
+            `Write 2–4 sentences, plain text, specific to your role and skills.`,
+          ]
+            .filter(Boolean)
+            .join("\n\n");
 
-      const timeoutMs = runtime.timeoutSec > 0 ? Math.min(600_000, runtime.timeoutSec * 1000) : 120_000;
+      const defaultTimeout = task ? 300_000 : 120_000;
+      const timeoutMs = runtime.timeoutSec > 0 ? Math.min(600_000, runtime.timeoutSec * 1000) : defaultTimeout;
       addRunEvent(run.id, { kind: "event", message: `llm: routing=${routing} model=${modelId}` });
-      const llm = await completeLlmChat({
-        routing,
-        model: modelId,
-        system: systemPrompt,
-        user: userPrompt,
-        timeoutMs,
-        ollamaBaseUrl: routing === "ollama" ? resolveOllamaBaseUrl(tenant.ollamaBaseUrl) : undefined,
-      });
-      if (!llm.ok) {
-        addRunEvent(run.id, { kind: "stderr", message: `llm error: ${llm.error}` });
-        finishAgentRun(run.id, { status: "failed", error: "llm", summary: "LLM request failed" });
-        return { ok: false as const, reason: "llm_error" as const };
+      const useRealHermes = String(process.env.USE_REAL_HERMES_AGENT ?? "").toLowerCase() === "true";
+      if (useRealHermes) {
+        const prompt = `${systemPrompt}\n\n---\n\n${userPrompt}`;
+        const hermes = await completeViaHermesAgentCli({
+          provider: routing,
+          model: modelId,
+          prompt,
+          timeoutMs,
+        });
+        if (!hermes.ok) {
+          addRunEvent(run.id, { kind: "stderr", message: `hermes-agent cli error: ${hermes.error}` });
+          auditAndInvalidate(tenantId, ["agents"], {
+            agentId,
+            agentName: `${agent.displayName} (${agent.role})`,
+            action: "agent_run_failed",
+            entity: "agent_run",
+            entityId: String(run.id),
+            detail: `hermes_agent_error provider=${routing} model=${modelId}. Fix: install Hermes Agent and ensure \`hermes\` is on PATH. Error: ${hermes.error}`,
+            tokensUsed: 0,
+            cost: 0,
+          });
+          finishAgentRun(run.id, { status: "failed", error: "llm", summary: "Hermes Agent CLI failed" });
+          return { ok: false as const, reason: "llm_error" as const };
+        }
+        assistantBody = hermes.text;
+        llmMode = "live";
+        addRunEvent(run.id, { kind: "stdout", message: "hermes-agent: ok (cli)" });
+      } else {
+        const llm = await completeLlmChat({
+          routing,
+          model: modelId,
+          system: systemPrompt,
+          user: userPrompt,
+          timeoutMs,
+          ollamaBaseUrl: routing === "ollama" ? resolveOllamaBaseUrl(tenant.ollamaBaseUrl) : undefined,
+          ollamaApiKey: routing === "ollama" ? getTenantOllamaApiKey(tenantId).apiKey : null,
+          openRouterApiKey: openRouterKey,
+        });
+        if (!llm.ok) {
+          addRunEvent(run.id, { kind: "stderr", message: `llm error: ${llm.error}` });
+          const hint =
+            routing === "ollama"
+              ? "Fix: ensure the model exists in Ollama (run `ollama pull <model>`), and that the Ollama base URL is reachable from the server."
+              : "Fix: set OPENROUTER_API_KEY on the server, or switch this agent to Ollama routing.";
+          auditAndInvalidate(tenantId, ["agents"], {
+            agentId,
+            agentName: `${agent.displayName} (${agent.role})`,
+            action: "agent_run_failed",
+            entity: "agent_run",
+            entityId: String(run.id),
+            detail: `llm_error routing=${routing} model=${modelId}. ${hint} Error: ${String(llm.error).slice(0, 1200)}`,
+            tokensUsed: 0,
+            cost: 0,
+          });
+          finishAgentRun(run.id, { status: "failed", error: "llm", summary: "LLM request failed" });
+          return { ok: false as const, reason: "llm_error" as const };
+        }
+        assistantBody = llm.text;
+        tokensUsed = Math.max(1, llm.promptTokens + llm.completionTokens);
+        costUsd = llm.estimatedCostUsd;
+        llmMode = "live";
+        addRunEvent(run.id, {
+          kind: "stdout",
+          message: `llm: ok tokens in=${llm.promptTokens} out=${llm.completionTokens} ~$${costUsd.toFixed(4)}`,
+        });
       }
-      assistantBody = llm.text;
-      tokensUsed = Math.max(1, llm.promptTokens + llm.completionTokens);
-      costUsd = llm.estimatedCostUsd;
-      llmMode = "live";
-      addRunEvent(run.id, {
-        kind: "stdout",
-        message: `llm: ok tokens in=${llm.promptTokens} out=${llm.completionTokens} ~$${costUsd.toFixed(4)}`,
-      });
     } else {
       if (routing === "openrouter" && !getOpenRouterApiKey()) {
         addRunEvent(run.id, {
@@ -191,14 +455,19 @@ export async function hermesRunOnce(
           message: "llm: skipped (set OPENROUTER_API_KEY on the server for OpenRouter routing)",
         });
       }
-      const replyTo =
-        lastMsg && lastMsg.senderAgentId !== agentId
-          ? `Replying to ${lastMsg.senderName}: “${String(lastMsg.content).slice(0, 120)}${String(lastMsg.content).length > 120 ? "…" : ""}”\n\n`
-          : "";
-      const workSummary = task
-        ? `Update (${reason}): I will handle “${task.title}”.`
-        : `Update (${reason}): No pending tasks found — monitoring for new work.`;
-      assistantBody = `${replyTo}${workSummary}\n${skillLine}\n\nSkills context source: ${skills.source}${skills.updatedAt ? ` (${skills.updatedAt})` : ""}`;
+      assistantBody = generateAutonomousSimMessage(agent, def, task, lastMsg, reason, bullets);
+    }
+
+    let deliverableFiles: string[] = [];
+    if (task && llmMode === "live") {
+      try {
+        deliverableFiles = processAgentDeliverable(tenantId, task.id, agent.displayName, assistantBody);
+        if (deliverableFiles.length > 0) {
+          addRunEvent(run.id, { kind: "stdout", message: `extracted ${deliverableFiles.length} deliverable file(s) for task #${task.id}` });
+        }
+      } catch (e: any) {
+        addRunEvent(run.id, { kind: "stderr", message: `deliverable extraction error: ${String(e?.message ?? e)}` });
+      }
     }
 
     const posted = storage.createMessage({
@@ -210,7 +479,9 @@ export async function hermesRunOnce(
       senderEmoji: def.emoji ?? "🤖",
       content: assistantBody,
       messageType: reason === "scheduled" ? "heartbeat" : "chat",
-      metadata: llmMode === "live" ? { llm: true, model: modelId } : null,
+      metadata: llmMode === "live"
+        ? { llm: true, model: modelId, ...(deliverableFiles.length > 0 ? { deliverableFiles, taskId: task?.id } : {}) }
+        : null,
     } as any);
     addRunEvent(run.id, { kind: "stdout", message: `posted message #${posted.id} to ${primary.channelId}` });
 
@@ -256,7 +527,9 @@ export async function hermesRunOnce(
       }
     }
 
-    if (task) {
+    let waitingOnCeoDelegation = false;
+    const isDelegatedChild = !!task?.description && /parentTaskId:\d+/.test(String(task.description));
+    if (task && !isDelegatedChild) {
       if (!task.assignedAgentId) {
         storage.updateTask(task.id, { assignedAgentId: agentId, status: "in_progress" } as any);
         auditAndInvalidate(tenantId, ["tasks", "goals"], {
@@ -269,7 +542,7 @@ export async function hermesRunOnce(
           tokensUsed: 0,
           cost: 0,
         });
-      } else {
+      } else if (task.status !== "in_progress") {
         storage.updateTask(task.id, { status: "in_progress" } as any);
         auditAndInvalidate(tenantId, ["tasks", "goals"], {
           agentId,
@@ -282,49 +555,69 @@ export async function hermesRunOnce(
           cost: 0,
         });
       }
-      storage.updateTask(task.id, { status: "done", actualTokens: tokensUsed } as any);
-      addRunEvent(run.id, { kind: "event", message: `completed task #${task.id}` });
-      auditAndInvalidate(tenantId, ["tasks", "goals"], {
-        agentId,
-        agentName: agent.displayName,
-        action: "task_completed",
-        entity: "task",
-        entityId: String(task.id),
-        detail: task.title,
-        tokensUsed,
-        cost: costUsd,
-      });
 
-      if (task.teamId) {
-        const teamMsg = storage.createMessage({
-          tenantId,
-          channelId: `team-${task.teamId}`,
-          channelType: "team",
-          senderAgentId: agentId,
-          senderName: `${agent.displayName} (${agent.role})`,
-          senderEmoji: def.emoji ?? "🤖",
-          content: `Completed “${task.title}”. ${skillLine}`.trim(),
-          messageType: "chat",
-          metadata: null,
-        } as any);
-        addRunEvent(run.id, { kind: "stdout", message: `posted team message to team-${task.teamId}` });
-        auditAndInvalidate(tenantId, ["messages"], {
-          agentId,
-          agentName: `${agent.displayName} (${agent.role})`,
-          action: "message_sent",
-          entity: "message",
-          entityId: String(teamMsg.id),
-          detail: teamMsg.content.length > 200 ? `${teamMsg.content.slice(0, 200)}…` : teamMsg.content,
-          tokensUsed: 0,
-          cost: 0,
+      const isCeo = String(agent.role).toLowerCase() === "ceo";
+      const waitingOnDelegation = isCeo && hasOpenCeoDelegatedChildren(tenantId, task.id);
+      waitingOnCeoDelegation = waitingOnDelegation;
+
+      if (waitingOnDelegation) {
+        addRunEvent(run.id, {
+          kind: "event",
+          message: `CEO task #${task.id} kept open while delegated child tasks are still incomplete`,
         });
+      } else {
+        storage.updateTask(task.id, { status: "done", actualTokens: tokensUsed } as any);
+        addRunEvent(run.id, { kind: "event", message: `completed task #${task.id}` });
+        auditAndInvalidate(tenantId, ["tasks", "goals"], {
+          agentId,
+          agentName: agent.displayName,
+          action: "task_completed",
+          entity: "task",
+          entityId: String(task.id),
+          detail: task.title,
+          tokensUsed,
+          cost: costUsd,
+        });
+
+        if (task.teamId) {
+          const teamMsg = storage.createMessage({
+            tenantId,
+            channelId: `team-${task.teamId}`,
+            channelType: "team",
+            senderAgentId: agentId,
+            senderName: `${agent.displayName} (${agent.role})`,
+            senderEmoji: def.emoji ?? "🤖",
+            content: `Completed “${task.title}”. ${skillLine}`.trim(),
+            messageType: "chat",
+            metadata: null,
+          } as any);
+          addRunEvent(run.id, { kind: "stdout", message: `posted team message to team-${task.teamId}` });
+          auditAndInvalidate(tenantId, ["messages"], {
+            agentId,
+            agentName: `${agent.displayName} (${agent.role})`,
+            action: "message_sent",
+            entity: "message",
+            entityId: String(teamMsg.id),
+            detail: teamMsg.content.length > 200 ? `${teamMsg.content.slice(0, 200)}…` : teamMsg.content,
+            tokensUsed: 0,
+            cost: 0,
+          });
+        }
+
+        maybeAutoCloseParentCeoTask(task);
       }
+    } else if (task && isDelegatedChild) {
+      addRunEvent(run.id, {
+        kind: "event",
+        message: `task #${task.id} is CEO-delegated — lifecycle managed by delegation runner`,
+      });
     }
 
     const spent = (agent.spentThisMonth ?? 0) + costUsd;
+    const completedThisRun = !!task && !isDelegatedChild && !waitingOnCeoDelegation;
     storage.updateAgent(agentId, {
       lastHeartbeat: nowIso,
-      tasksCompleted: agent.tasksCompleted + (task ? 1 : 0),
+      tasksCompleted: agent.tasksCompleted + (completedThisRun ? 1 : 0),
       spentThisMonth: spent,
     });
     upsertAgentRuntimeSettings(agentId, { lastRunAt: nowIso });

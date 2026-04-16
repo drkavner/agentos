@@ -1,4 +1,4 @@
-# Frontend Developer — Skills
+# 🎨 Frontend Developer — SKILLS
 
 ## Summary
 Builds pixel-perfect UIs and optimizes Core Web Vitals
@@ -11,7 +11,7 @@ Engineering
 - UI implementation
 - performance
 
-## When to use
+## When to Use
 Modern web apps, pixel-perfect UIs, Core Web Vitals optimization
 
 ## Source

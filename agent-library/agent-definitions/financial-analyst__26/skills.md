@@ -1,4 +1,4 @@
-# Financial Analyst — Skills
+# 📊 Financial Analyst — SKILLS
 
 ## Summary
 Builds three-statement models and supports data-driven decisions
@@ -11,7 +11,7 @@ Finance
 - forecasting
 - scenario analysis
 
-## When to use
+## When to Use
 Three-statement models, variance analysis, data-driven business intelligence
 
 ## Source

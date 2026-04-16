@@ -1,4 +1,4 @@
-# Brand Guardian — Skills
+# 🎭 Brand Guardian — SKILLS
 
 ## Summary
 Develops and protects brand strategy and guidelines
@@ -11,7 +11,7 @@ Design
 - consistency
 - positioning
 
-## When to use
+## When to Use
 Brand strategy, identity development, guidelines
 
 ## Source

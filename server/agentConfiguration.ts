@@ -6,9 +6,13 @@ let ensured = false;
 
 export type LlmProviderRouting = "openrouter" | "ollama";
 
+export type AgentAdapterType = "hermes" | "openclaw" | "cli";
+
 export type AgentRuntimeSettings = {
   /** Where model id is resolved: OpenRouter cloud or local Ollama. */
   llmProvider: LlmProviderRouting;
+  /** Execution adapter: hermes (internal sim/LLM), openclaw (gateway), cli (external CLI like claude/codex/gemini). */
+  adapterType: AgentAdapterType;
   bypassSandbox: boolean;
   enableSearch: boolean;
   command: string;
@@ -88,6 +92,7 @@ export function ensureAgentConfigurationTables() {
   add("max_concurrent_runs", "ALTER TABLE agent_runtime_settings ADD COLUMN max_concurrent_runs INTEGER NOT NULL DEFAULT 1");
   add("last_run_at", "ALTER TABLE agent_runtime_settings ADD COLUMN last_run_at TEXT");
   add("llm_provider", "ALTER TABLE agent_runtime_settings ADD COLUMN llm_provider TEXT NOT NULL DEFAULT 'openrouter'");
+  add("adapter_type", "ALTER TABLE agent_runtime_settings ADD COLUMN adapter_type TEXT NOT NULL DEFAULT 'hermes'");
 
   db.run(sql`
     CREATE TABLE IF NOT EXISTS agent_run_locks (
@@ -151,6 +156,7 @@ export function getAgentRuntimeSettings(agentId: number): AgentRuntimeSettings {
   const row = db.get(sql`
     SELECT
       llm_provider as llmProvider,
+      adapter_type as adapterType,
       bypass_sandbox as bypassSandbox,
       enable_search as enableSearch,
       command as command,
@@ -179,8 +185,12 @@ export function getAgentRuntimeSettings(agentId: number): AgentRuntimeSettings {
   const llmRaw = String(row?.llmProvider ?? "openrouter").toLowerCase();
   const llmProvider: LlmProviderRouting = llmRaw === "ollama" ? "ollama" : "openrouter";
 
+  const adapterRaw = String(row?.adapterType ?? "hermes").toLowerCase();
+  const adapterType: AgentAdapterType = (["hermes", "openclaw", "cli"].includes(adapterRaw) ? adapterRaw : "hermes") as AgentAdapterType;
+
   return {
     llmProvider,
+    adapterType,
     bypassSandbox: row?.bypassSandbox === undefined ? defaultBypassSandbox : !!row?.bypassSandbox,
     enableSearch: !!row?.enableSearch,
     command: String(row?.command ?? ""),
@@ -210,6 +220,7 @@ export function upsertAgentRuntimeSettings(agentId: number, patch: Partial<Agent
     ...existing,
     ...patch,
     llmProvider: patch.llmProvider != null ? (patch.llmProvider === "ollama" ? "ollama" : "openrouter") : existing.llmProvider,
+    adapterType: patch.adapterType != null ? patch.adapterType : existing.adapterType,
     heartbeatEverySec: patch.heartbeatEverySec ? Math.max(60, patch.heartbeatEverySec) : existing.heartbeatEverySec,
     cooldownSec: patch.cooldownSec != null ? Math.max(0, Math.floor(patch.cooldownSec)) : existing.cooldownSec,
     maxConcurrentRuns: patch.maxConcurrentRuns != null ? Math.max(1, Math.floor(patch.maxConcurrentRuns)) : existing.maxConcurrentRuns,
@@ -219,6 +230,7 @@ export function upsertAgentRuntimeSettings(agentId: number, patch: Partial<Agent
     INSERT INTO agent_runtime_settings (
       agent_id,
       llm_provider,
+      adapter_type,
       bypass_sandbox,
       enable_search,
       command,
@@ -239,6 +251,7 @@ export function upsertAgentRuntimeSettings(agentId: number, patch: Partial<Agent
     ) VALUES (
       ${agentId},
       ${next.llmProvider},
+      ${next.adapterType},
       ${next.bypassSandbox ? 1 : 0},
       ${next.enableSearch ? 1 : 0},
       ${next.command},
@@ -259,6 +272,7 @@ export function upsertAgentRuntimeSettings(agentId: number, patch: Partial<Agent
     )
     ON CONFLICT(agent_id) DO UPDATE SET
       llm_provider = excluded.llm_provider,
+      adapter_type = excluded.adapter_type,
       bypass_sandbox = excluded.bypass_sandbox,
       enable_search = excluded.enable_search,
       command = excluded.command,
@@ -281,10 +295,21 @@ export function upsertAgentRuntimeSettings(agentId: number, patch: Partial<Agent
 
 export function tryAcquireAgentRunLock(agentId: number) {
   ensureAgentConfigurationTables();
-  const existing = db.get(sql`SELECT agent_id FROM agent_run_locks WHERE agent_id = ${agentId}`) as any | undefined;
-  if (existing) return false;
-  const now = new Date().toISOString();
-  db.run(sql`INSERT INTO agent_run_locks (agent_id, started_at) VALUES (${agentId}, ${now})`);
+  const existing = db.get(
+    sql`SELECT agent_id, started_at as startedAt FROM agent_run_locks WHERE agent_id = ${agentId}`,
+  ) as any | undefined;
+  if (existing) {
+    const startedAtRaw = String(existing.startedAt ?? "");
+    const startedAtMs = Date.parse(startedAtRaw);
+    const ageMs = Number.isFinite(startedAtMs) ? Date.now() - startedAtMs : Infinity;
+    // If the server crashed mid-run, the lock can be left behind forever.
+    // Treat old locks as stale and reclaim them.
+    const STALE_LOCK_MS = 10 * 60 * 1000;
+    if (ageMs <= STALE_LOCK_MS) return false;
+    db.run(sql`DELETE FROM agent_run_locks WHERE agent_id = ${agentId}`);
+  }
+  const nowIso = new Date().toISOString();
+  db.run(sql`INSERT INTO agent_run_locks (agent_id, started_at) VALUES (${agentId}, ${nowIso})`);
   return true;
 }
 

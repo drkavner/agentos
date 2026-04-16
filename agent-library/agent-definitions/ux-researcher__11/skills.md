@@ -1,4 +1,4 @@
-# UX Researcher — Skills
+# 🔍 UX Researcher — SKILLS
 
 ## Summary
 Conducts usability testing and extracts design insights
@@ -11,7 +11,7 @@ Design
 - behavior analysis
 - research
 
-## When to use
+## When to Use
 Understanding users, usability testing, design insights
 
 ## Source

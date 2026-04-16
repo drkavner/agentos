@@ -2,10 +2,12 @@ import fs from "fs";
 import path from "path";
 import Database from "better-sqlite3";
 import { resolveSqliteDbPath } from "../server/dbPath";
+import { AGENT_DOC_TYPES, renderAgentDoc, type AgentDefInput } from "../server/agentDocTemplates";
 
 type AgentDefinitionRow = {
   id: number;
   name: string;
+  emoji: string;
   division: string;
   specialty: string;
   description: string;
@@ -27,45 +29,6 @@ function ensureDir(dir: string) {
   fs.mkdirSync(dir, { recursive: true });
 }
 
-function mdEscape(s: string) {
-  return String(s ?? "").replace(/\r\n/g, "\n").trim();
-}
-
-function guessSkillBullets(def: AgentDefinitionRow) {
-  // Keep it deterministic; "specialty" is already curated seed text.
-  const raw = def.specialty
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-  const uniq: string[] = [];
-  for (const r of raw) {
-    const key = r.toLowerCase();
-    if (!uniq.some((u) => u.toLowerCase() === key)) uniq.push(r);
-  }
-  return uniq.length > 0 ? uniq : [def.specialty];
-}
-
-function renderSkillsMd(def: AgentDefinitionRow) {
-  const bullets = guessSkillBullets(def);
-  return `# ${mdEscape(def.name)} — Skills
-
-## Summary
-${mdEscape(def.description)}
-
-## Division
-${mdEscape(def.division)}
-
-## Skills
-${bullets.map((b) => `- ${mdEscape(b)}`).join("\n")}
-
-## When to use
-${mdEscape(def.when_to_use)}
-
-## Source
-${mdEscape(def.source)}
-`;
-}
-
 function main() {
   const dbPath = resolveSqliteDbPath();
   const outRoot = path.join(process.cwd(), "agent-library");
@@ -76,7 +39,7 @@ function main() {
   const db = new Database(dbPath);
   const rows = db
     .prepare(
-      `select id, name, division, specialty, description, when_to_use, source
+      `select id, name, emoji, division, specialty, description, when_to_use, source
        from agent_definitions
        order by division asc, name asc`,
     )
@@ -94,24 +57,49 @@ function main() {
 
 This folder is generated from the SQLite database.
 
-- Per Agent Library template, we generate a \`skills.md\`.
-- Run: \`npm run skills:generate\`
+Each agent definition gets a folder with 5 canonical docs:
+- **SOUL.md** — Identity, personality, values
+- **AGENT.md** — Role, mission, operational rules
+- **HEARTBEAT.md** — Scheduled heartbeat behavior
+- **TOOLS.md** — Available tools and integrations
+- **SKILLS.md** — Core skills and when to use
 
-Output path: \`agent-library/agent-definitions/<slug>__<id>/skills.md\`
+Run: \`npm run skills:generate\`
+
+Output path: \`agent-library/agent-definitions/<slug>__<id>/\`
 `;
   fs.writeFileSync(path.join(outRoot, "README.md"), readme);
 
-  let count = 0;
-  for (const def of rows) {
-    const slug = slugify(def.name);
-    const folder = path.join(outDefs, `${slug}__${def.id}`);
+  let fileCount = 0;
+  for (const row of rows) {
+    const slug = slugify(row.name);
+    const folder = path.join(outDefs, `${slug}__${row.id}`);
     ensureDir(folder);
-    fs.writeFileSync(path.join(folder, "skills.md"), renderSkillsMd(def));
-    count++;
+
+    const def: AgentDefInput = {
+      id: row.id,
+      name: row.name,
+      emoji: row.emoji,
+      division: row.division,
+      specialty: row.specialty,
+      description: row.description,
+      whenToUse: row.when_to_use,
+      source: row.source,
+    };
+
+    for (const docType of AGENT_DOC_TYPES) {
+      const filename = `${docType}.md`;
+      const content = renderAgentDoc(docType, def);
+      fs.writeFileSync(path.join(folder, filename), content);
+      fileCount++;
+    }
+
+    // Keep backward-compatible skills.md (lowercase alias)
+    const skillsContent = renderAgentDoc("SKILLS", def);
+    fs.writeFileSync(path.join(folder, "skills.md"), skillsContent);
   }
 
-  console.log(`Generated ${count} skills.md files in ${outDefs}`);
+  console.log(`Generated ${fileCount} doc files across ${rows.length} agent definitions in ${outDefs}`);
 }
 
 main();
-

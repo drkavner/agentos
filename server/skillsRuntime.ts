@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { storage } from "./storage";
+import { AGENT_DOC_TYPES, renderAgentDoc, type AgentDefInput, type AgentDocType } from "./agentDocTemplates";
 
 function slugify(input: string) {
   return input
@@ -82,3 +83,54 @@ export async function getEffectiveDefinitionSkills(
   }
 }
 
+// ─── Full agent docs (SOUL, AGENT, HEARTBEAT, TOOLS, SKILLS) ───────────────
+
+export type AgentDocs = Record<AgentDocType, { markdown: string; source: "file" | "generated" }>;
+
+function defToInput(def: { id: number; name: string; emoji: string; division: string; specialty: string; description: string; whenToUse: string; source: string }): AgentDefInput {
+  return { id: def.id, name: def.name, emoji: def.emoji, division: def.division, specialty: def.specialty, description: def.description, whenToUse: def.whenToUse, source: def.source };
+}
+
+export async function getAgentDocs(definitionId: number): Promise<AgentDocs | null> {
+  const def = storage.getAgentDefinition(definitionId);
+  if (!def) return null;
+
+  const outRoot = path.join(process.cwd(), "agent-library", "agent-definitions");
+  const folder = `${slugify(def.name)}__${def.id}`;
+  const input = defToInput(def);
+  const result = {} as AgentDocs;
+
+  for (const docType of AGENT_DOC_TYPES) {
+    const filePath = path.join(outRoot, folder, `${docType}.md`);
+    try {
+      const md = await fs.promises.readFile(filePath, "utf-8");
+      result[docType] = { markdown: md, source: "file" };
+    } catch {
+      result[docType] = { markdown: renderAgentDoc(docType, input), source: "generated" };
+    }
+  }
+
+  return result;
+}
+
+export function getAgentDocsSync(definitionId: number): AgentDocs | null {
+  const def = storage.getAgentDefinition(definitionId);
+  if (!def) return null;
+
+  const outRoot = path.join(process.cwd(), "agent-library", "agent-definitions");
+  const folder = `${slugify(def.name)}__${def.id}`;
+  const input = defToInput(def);
+  const result = {} as AgentDocs;
+
+  for (const docType of AGENT_DOC_TYPES) {
+    const filePath = path.join(outRoot, folder, `${docType}.md`);
+    try {
+      const md = fs.readFileSync(filePath, "utf-8");
+      result[docType] = { markdown: md, source: "file" };
+    } catch {
+      result[docType] = { markdown: renderAgentDoc(docType, input), source: "generated" };
+    }
+  }
+
+  return result;
+}

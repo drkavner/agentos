@@ -1,4 +1,4 @@
-# Outbound Strategist — Skills
+# 🎯 Outbound Strategist — SKILLS
 
 ## Summary
 Builds pipeline through research-driven outreach
@@ -11,7 +11,7 @@ Sales
 - multi-channel sequences
 - ICP targeting
 
-## When to use
+## When to Use
 Building pipeline through research-driven outreach, not volume
 
 ## Source

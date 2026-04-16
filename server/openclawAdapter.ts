@@ -29,7 +29,7 @@ export async function openclawRunOnce(
   if (!agent || agent.tenantId !== tenantId) return { ok: false, error: "agent_not_found" };
   const tenant = storage.getTenant(tenantId);
   if (!tenant) return { ok: false, error: "tenant_not_found" };
-  if (tenant.adapterType !== "openclaw") return { ok: false, error: "not_openclaw" };
+  // Per-agent adapter override: allow openclaw runs regardless of tenant default
 
   const run = createAgentRun({ tenantId, agentId, trigger: "on_demand" });
   addRunEvent(run.id, {
@@ -140,11 +140,63 @@ export async function collaborationAfterUserMessage(
   if (tenant.adapterType === "hermes") {
     const agents = storage.getAgents(tenantId);
     const ceo = agents.find((a) => String(a.role).toLowerCase() === "ceo");
-    const anyRunning = agents.find((a) => a.status === "running");
-    const target = (ceo?.status === "running" ? ceo : null) ?? anyRunning ?? ceo;
-    if (!target) return;
+    const dmMatch = /^dm-(\d+)$/.exec(channelId);
+    const dmTarget = dmMatch ? agents.find((a) => a.id === Number(dmMatch[1])) : undefined;
+    const running = agents.filter((a) => a.status === "running");
+    const isDm = !!dmMatch;
+    // In a DM channel, run a single target; in general/team, fan-out to multiple agents.
+    const targets = isDm
+      ? [
+          (dmTarget?.status === "running" ? dmTarget : null) ??
+            (ceo?.status === "running" ? ceo : null) ??
+            running[0] ??
+            dmTarget ??
+            ceo,
+        ].filter(Boolean)
+      : [
+          // CEO should lead the thread first, then other running agents chime in.
+          ...(ceo?.status === "running" ? [ceo] : []),
+          ...running.filter((a) => a.id !== ceo?.id),
+        ].slice(0, 3); // cap to avoid spam
+    if (targets.length === 0) return;
     const { hermesRunOnce } = await import("./hermesAdapter");
-    await hermesRunOnce(tenantId, target.id, { reason: "manual" });
+    const channelType = channelId.startsWith("team-") ? "team" : channelId.startsWith("dm-") ? "dm" : "general";
+    for (const target of targets) {
+      // eslint-disable-next-line no-await-in-loop
+      const run = await hermesRunOnce(tenantId, (target as any).id, {
+        reason: "manual",
+        forceChannelId: channelId,
+        forceChannelType: channelType as any,
+        bypassCooldown: true,
+      });
+      if (!run.ok) {
+        const def = storage.getAgentDefinition((target as any).definitionId);
+        const posted = storage.createMessage({
+          tenantId,
+          channelId,
+          channelType,
+          senderAgentId: (target as any).id,
+          senderName: `${(target as any).displayName} (${(target as any).role})`,
+          senderEmoji: def?.emoji ?? "🤖",
+          content:
+            `⚠️ Agent run failed (${run.reason}). ` +
+            `Check Audit Log for the full error. ` +
+            `If this agent uses a cloud model (e.g. ":cloud"), verify the provider key/subscription or switch to a local model.`,
+          messageType: "system",
+          metadata: { hermesError: true, reason: run.reason, channelId },
+        } as any);
+        auditAndInvalidate(tenantId, ["messages"], {
+          agentId: (target as any).id,
+          agentName: `${(target as any).displayName} (${(target as any).role})`,
+          action: "message_sent",
+          entity: "message",
+          entityId: String(posted.id),
+          detail: posted.content.length > 200 ? `${posted.content.slice(0, 200)}…` : posted.content,
+          tokensUsed: 0,
+          cost: 0,
+        });
+      }
+    }
   }
 }
 
@@ -153,10 +205,13 @@ async function openclawCollaborationAck(tenantId: number, channelId: string, use
   const ceo = agents.find((a) => String(a.role).toLowerCase() === "ceo");
   const dmMatch = /^dm-(\d+)$/.exec(channelId);
   const dmAgent = dmMatch ? agents.find((a) => a.id === Number(dmMatch[1])) : undefined;
-  const agent = dmAgent ?? ceo ?? agents.find((a) => a.status === "running");
-  if (!agent) return;
+  const running = agents.filter((a) => a.status === "running");
+  const isDm = !!dmMatch;
+  const targets = isDm
+    ? [dmAgent ?? ceo ?? running[0]].filter(Boolean)
+    : (running.length ? running : [ceo].filter(Boolean)).slice(0, 3); // cap to avoid spam
+  if (targets.length === 0) return;
 
-  const def = storage.getAgentDefinition(agent.definitionId);
   const channelType = channelId.startsWith("team-")
     ? "team"
     : channelId.startsWith("dm-")
@@ -169,32 +224,36 @@ async function openclawCollaborationAck(tenantId: number, channelId: string, use
         ? `${userContent.trim().slice(0, 157)}…`
         : userContent.trim()
       : "";
-  const content = [
-    snippet ? `You said: “${snippet}”` : `Ping in #${channelId.replace(/^team-/, "team ").replace(/^dm-/, "DM ")}.`,
-    `I’m ${agent.displayName} (${agent.role}) — this org uses OpenClaw; heavy work runs in your gateway, but Cortex keeps this channel two-way.`,
-    `Use Run on an agent to log a run here, or connect your gateway for deeper automation.`,
-  ].join(" ");
+  for (const agent of targets) {
+    if (!agent) continue;
+    const def = storage.getAgentDefinition(agent.definitionId);
+    const content = [
+      snippet ? `You said: “${snippet}”` : `Ping in #${channelId.replace(/^team-/, "team ").replace(/^dm-/, "DM ")}.`,
+      `I’m ${agent.displayName} (${agent.role}) — this org uses OpenClaw; heavy work runs in your gateway, but Cortex keeps this channel two-way.`,
+      `Use Run on an agent to log a run here, or connect your gateway for deeper automation.`,
+    ].join(" ");
 
-  const posted = storage.createMessage({
-    tenantId,
-    channelId,
-    channelType,
-    senderAgentId: agent.id,
-    senderName: `${agent.displayName} (${agent.role})`,
-    senderEmoji: def?.emoji ?? "🤖",
-    content,
-    messageType: "chat",
-    metadata: { openclawCollaboration: true },
-  } as any);
+    const posted = storage.createMessage({
+      tenantId,
+      channelId,
+      channelType,
+      senderAgentId: agent.id,
+      senderName: `${agent.displayName} (${agent.role})`,
+      senderEmoji: def?.emoji ?? "🤖",
+      content,
+      messageType: "chat",
+      metadata: { openclawCollaboration: true },
+    } as any);
 
-  auditAndInvalidate(tenantId, ["messages"], {
-    agentId: agent.id,
-    agentName: `${agent.displayName} (${agent.role})`,
-    action: "message_sent",
-    entity: "message",
-    entityId: String(posted.id),
-    detail: content.slice(0, 200),
-    tokensUsed: 0,
-    cost: 0,
-  });
+    auditAndInvalidate(tenantId, ["messages"], {
+      agentId: agent.id,
+      agentName: `${agent.displayName} (${agent.role})`,
+      action: "message_sent",
+      entity: "message",
+      entityId: String(posted.id),
+      detail: content.slice(0, 200),
+      tokensUsed: 0,
+      cost: 0,
+    });
+  }
 }

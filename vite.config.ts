@@ -25,7 +25,7 @@ export default defineConfig({
     // Standalone `vite` (default :5173) has no Express. Forward API to the Cortex server (same default as `npm run dev`).
     proxy: {
       "/api": {
-        target: process.env.CORTEX_API_TARGET ?? "http://127.0.0.1:5050",
+        target: process.env.CORTEX_API_TARGET ?? "http://127.0.0.1:3000",
         changeOrigin: true,
       },
     },

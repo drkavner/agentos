@@ -19,6 +19,14 @@ export function getOpenRouterApiKey(): string | null {
   return (process.env.OPENROUTER_API_KEY ?? "").trim() || null;
 }
 
+/**
+ * API key for direct access to ollama.com's hosted API (`https://ollama.com/api/...`).
+ * Note: local Ollama (`http://localhost:11434`) does not require auth.
+ */
+export function getOllamaApiKey(): string | null {
+  return (process.env.OLLAMA_API_KEY ?? "").trim() || null;
+}
+
 export function getOllamaBaseUrl(): string {
   const raw = (process.env.OLLAMA_BASE_URL ?? "http://127.0.0.1:11434").trim();
   return raw.replace(/\/+$/, "");
@@ -61,12 +69,18 @@ export function sanitizeOllamaProbeUrl(input: string | undefined | null): string
 /** Lists model names from a running Ollama instance (`GET /api/tags`). */
 export async function listOllamaModels(
   baseUrl: string,
+  opts?: { apiKey?: string | null },
 ): Promise<{ ok: true; models: string[]; baseUsed: string } | { ok: false; error: string }> {
   const baseUsed = normalizeOllamaBase(baseUrl);
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), 8000);
   try {
-    const res = await fetch(`${baseUsed}/api/tags`, { method: "GET", signal: ac.signal });
+    const headers: Record<string, string> = {};
+    const apiKey = (opts?.apiKey ?? "").trim();
+    if (apiKey && /^https:\/\/ollama\.com(\/|$)/i.test(baseUsed)) {
+      headers.Authorization = `Bearer ${apiKey}`;
+    }
+    const res = await fetch(`${baseUsed}/api/tags`, { method: "GET", signal: ac.signal, headers });
     const raw = await res.text();
     if (!res.ok) {
       return { ok: false, error: raw.slice(0, 800) || res.statusText };
@@ -99,13 +113,34 @@ export async function listOllamaModels(
 }
 
 /** For Settings / test-environment: what’s configured on the server. */
-export function getLlmServerStatus(routing: LlmRouting, modelId: string, tenantOllamaBaseUrl?: string | null) {
+export function getLlmServerStatus(
+  routing: LlmRouting,
+  modelId: string,
+  tenantOllamaBaseUrl?: string | null,
+  opts?: { ollamaApiKeyConfigured?: boolean; openRouterApiKeyConfigured?: boolean },
+) {
   return {
     routing,
     model: modelId,
-    openRouterKeyConfigured: !!getOpenRouterApiKey(),
+    openRouterKeyConfigured: opts?.openRouterApiKeyConfigured ?? !!getOpenRouterApiKey(),
+    ollamaKeyConfigured: opts?.ollamaApiKeyConfigured ?? !!getOllamaApiKey(),
     ollamaBaseUrl: resolveOllamaBaseUrl(tenantOllamaBaseUrl),
   };
+}
+
+function isCloudModel(model: string) {
+  const m = (model || "").trim().toLowerCase();
+  return m.endsWith("-cloud") || m.includes(":cloud");
+}
+
+/** For direct ollama.com API calls, the model name typically omits the cloud suffix. */
+function normalizeCloudModelName(model: string) {
+  let m = (model || "").trim();
+  if (!m) return m;
+  if (m.toLowerCase().endsWith("-cloud")) m = m.slice(0, -"-cloud".length);
+  // Some environments use a `:cloud` tag (e.g. `glm-5.1:cloud`). Strip it for direct cloud API calls.
+  if (m.toLowerCase().endsWith(":cloud")) m = m.slice(0, -":cloud".length);
+  return m;
 }
 
 function estimateOpenRouterUsd(model: string, promptTokens: number, completionTokens: number): number {
@@ -143,6 +178,25 @@ export type LlmOk = {
 
 export type LlmErr = { ok: false; error: string; status?: number };
 
+const OPENROUTER_MODEL_ALIASES: Record<string, string> = {
+  "claude-3-5-sonnet": "anthropic/claude-sonnet-4",
+  "claude-3.5-sonnet": "anthropic/claude-sonnet-4",
+  "claude-sonnet-4": "anthropic/claude-sonnet-4",
+  "claude-opus-4": "anthropic/claude-opus-4",
+  "gpt-4o": "openai/gpt-4.1",
+  "gpt-4o-mini": "openai/gpt-4.1-mini",
+  "gpt-4.1": "openai/gpt-4.1",
+  "gpt-4.1-mini": "openai/gpt-4.1-mini",
+  "gemini-2.0-flash": "google/gemini-2.5-flash",
+  "gemini-2.5-pro": "google/gemini-2.5-pro",
+  "gemini-2.5-flash": "google/gemini-2.5-flash",
+};
+
+function normalizeOpenRouterModel(model: string): string {
+  if (model.includes("/")) return model;
+  return OPENROUTER_MODEL_ALIASES[model] ?? `openrouter/auto`;
+}
+
 export async function completeLlmChat(opts: {
   routing: LlmRouting;
   model: string;
@@ -151,6 +205,10 @@ export async function completeLlmChat(opts: {
   timeoutMs: number;
   /** Resolved Ollama base URL (per-tenant or env); only used when routing is ollama. */
   ollamaBaseUrl?: string;
+  /** Optional API key for direct ollama.com cloud calls. */
+  ollamaApiKey?: string | null;
+  /** Optional API key for OpenRouter (overrides env). */
+  openRouterApiKey?: string | null;
 }): Promise<LlmOk | LlmErr> {
   const timeoutMs = Math.max(5000, opts.timeoutMs);
   const ac = new AbortController();
@@ -158,11 +216,11 @@ export async function completeLlmChat(opts: {
 
   try {
     if (opts.routing === "openrouter") {
-      const key = getOpenRouterApiKey();
+      const key = (opts.openRouterApiKey ?? getOpenRouterApiKey())?.trim() || null;
       if (!key) {
         return { ok: false, error: "Missing OPENROUTER_API_KEY for OpenRouter routing" };
       }
-      const modelUsed = opts.model.trim();
+      const modelUsed = normalizeOpenRouterModel(opts.model.trim());
       if (!modelUsed) {
         return { ok: false, error: "Model id is empty" };
       }
@@ -212,14 +270,27 @@ export async function completeLlmChat(opts: {
     }
 
     // Ollama — local, $0 estimated
-    const base = normalizeOllamaBase(opts.ollamaBaseUrl ?? getOllamaBaseUrl());
-    const modelUsed = opts.model.trim();
+    const configuredBase = normalizeOllamaBase(opts.ollamaBaseUrl ?? getOllamaBaseUrl());
+    const rawModel = opts.model.trim();
+    const ollamaKey = (opts.ollamaApiKey ?? getOllamaApiKey())?.trim() || null;
+
+    // If the user selected a cloud model and provided an API key, call ollama.com directly.
+    // This avoids relying on local daemon sign-in state and lets server-side env control auth.
+    const useDirectCloud = isCloudModel(rawModel) && !!ollamaKey;
+    const base = useDirectCloud ? "https://ollama.com" : configuredBase;
+    const modelUsed = useDirectCloud ? normalizeCloudModelName(rawModel) : rawModel;
     if (!modelUsed) {
       return { ok: false, error: "Model id is empty" };
     }
+
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (useDirectCloud && ollamaKey) {
+      headers.Authorization = `Bearer ${ollamaKey}`;
+    }
+
     const res = await fetch(`${base}/api/chat`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({
         model: modelUsed,
         stream: false,

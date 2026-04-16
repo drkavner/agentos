@@ -21,17 +21,35 @@ export const tenants = sqliteTable("tenants", {
 });
 
 /** Which execution plane runs deployed agents for this org (library hires use the org default). */
-export const tenantAdapterTypeEnum = z.enum(["hermes", "openclaw"]);
+export const tenantAdapterTypeEnum = z.enum([
+  "hermes",
+  "claude-code",
+  "codex",
+  "gemini-cli",
+  "opencode",
+  "cursor",
+  "openclaw",
+]);
 export type TenantAdapterType = z.infer<typeof tenantAdapterTypeEnum>;
 export const TENANT_ADAPTER_LABELS: Record<TenantAdapterType, string> = {
   hermes: "Hermes Agent",
-  openclaw: "Openclaw Gateway",
+  "claude-code": "Claude Code",
+  codex: "Codex",
+  "gemini-cli": "Gemini CLI",
+  opencode: "OpenCode",
+  cursor: "Cursor",
+  openclaw: "OpenClaw Gateway",
 };
 
 export const insertTenantSchema = createInsertSchema(tenants)
   .omit({ id: true, spentThisMonth: true })
   .extend({
     adapterType: tenantAdapterTypeEnum.optional(),
+    /** If false, skip auto-creating the CEO agent on org creation. */
+    useCeoAgent: z.boolean().optional(),
+    /** Optional defaults applied to the auto-created CEO agent at org creation time. */
+    ceoLlmProvider: z.enum(["openrouter", "ollama"]).optional(),
+    ceoModel: z.string().min(1).max(200).optional(),
   });
 export type InsertTenant = z.infer<typeof insertTenantSchema>;
 export type Tenant = typeof tenants.$inferSelect;
@@ -139,6 +157,7 @@ export const tasks = sqliteTable("tasks", {
   assignedAgentId: integer("assigned_agent_id").references(() => agents.id, { onDelete: "set null" }),
   createdById: integer("created_by_id").references(() => agents.id, { onDelete: "set null" }), // agent id
   teamId: integer("team_id").references(() => teams.id, { onDelete: "set null" }),
+  parentTaskId: integer("parent_task_id"), // CEO delegation chain / goal hierarchy
   goalTag: text("goal_tag"), // which company goal this traces to
   estimatedTokens: integer("estimated_tokens"),
   actualTokens: integer("actual_tokens"),

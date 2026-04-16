@@ -1,4 +1,4 @@
-# Software Architect — Skills
+# 🏛️ Software Architect — SKILLS
 
 ## Summary
 Makes architecture decisions and models domain systems
@@ -11,7 +11,7 @@ Engineering
 - DDD
 - architectural patterns
 
-## When to use
+## When to Use
 Architecture decisions, domain modeling, system evolution strategy
 
 ## Source

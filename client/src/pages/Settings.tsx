@@ -26,6 +26,8 @@ export default function Settings() {
   const tid = activeTenantId ?? 0;
   const { toast } = useToast();
   const [clearConfirmOpen, setClearConfirmOpen] = useState(false);
+  const [ollamaApiKey, setOllamaApiKey] = useState("");
+  const [openRouterApiKey, setOpenRouterApiKey] = useState("");
 
   const clearDemoData = useMutation({
     mutationFn: () => apiRequest("DELETE", `/api/tenants/${tid}/demo-data`),
@@ -39,6 +41,18 @@ export default function Settings() {
   const { data: tenant } = useQuery<Tenant>({
     queryKey: ["/api/tenants", tid],
     queryFn: () => apiRequest("GET", `/api/tenants/${tid}`).then(r => r.json()),
+  });
+
+  const { data: ollamaKeyStatus } = useQuery<{ configured: boolean; updatedAt: string | null }>({
+    queryKey: ["/api/tenants", tid, "ollama", "api-key"],
+    queryFn: () => apiRequest("GET", `/api/tenants/${tid}/ollama/api-key`).then(r => r.json()),
+    enabled: tid > 0,
+  });
+
+  const { data: openRouterKeyStatus } = useQuery<{ configured: boolean; updatedAt: string | null }>({
+    queryKey: ["/api/tenants", tid, "openrouter", "api-key"],
+    queryFn: () => apiRequest("GET", `/api/tenants/${tid}/openrouter/api-key`).then(r => r.json()),
+    enabled: tid > 0,
   });
 
   const form = useForm({
@@ -78,6 +92,60 @@ export default function Settings() {
       toast({ title: "Settings saved" });
     },
     onError: () => toast({ title: "Error", description: "Failed to save settings", variant: "destructive" }),
+  });
+
+  const saveOllamaApiKey = useMutation({
+    mutationFn: async () => {
+      const apiKey = String(ollamaApiKey || "").trim();
+      const r = await apiRequest("PUT", `/api/tenants/${tid}/ollama/api-key`, { apiKey });
+      return readJsonOrApiHint<{ ok: boolean; configured: boolean }>(r);
+    },
+    onSuccess: () => {
+      setOllamaApiKey("");
+      queryClient.invalidateQueries({ queryKey: ["/api/tenants", tid, "ollama", "api-key"] });
+      toast({ title: "Ollama API key saved" });
+    },
+    onError: (e: any) => toast({ title: "Error", description: String(e?.message ?? "Failed to save API key"), variant: "destructive" }),
+  });
+
+  const clearOllamaApiKey = useMutation({
+    mutationFn: async () => {
+      const r = await apiRequest("DELETE", `/api/tenants/${tid}/ollama/api-key`);
+      return readJsonOrApiHint<{ ok: boolean; configured: boolean }>(r);
+    },
+    onSuccess: () => {
+      setOllamaApiKey("");
+      queryClient.invalidateQueries({ queryKey: ["/api/tenants", tid, "ollama", "api-key"] });
+      toast({ title: "Ollama API key cleared" });
+    },
+    onError: (e: any) => toast({ title: "Error", description: String(e?.message ?? "Failed to clear API key"), variant: "destructive" }),
+  });
+
+  const saveOpenRouterApiKey = useMutation({
+    mutationFn: async () => {
+      const apiKey = String(openRouterApiKey || "").trim();
+      const r = await apiRequest("PUT", `/api/tenants/${tid}/openrouter/api-key`, { apiKey });
+      return readJsonOrApiHint<{ ok: boolean; configured: boolean }>(r);
+    },
+    onSuccess: () => {
+      setOpenRouterApiKey("");
+      queryClient.invalidateQueries({ queryKey: ["/api/tenants", tid, "openrouter", "api-key"] });
+      toast({ title: "OpenRouter API key saved" });
+    },
+    onError: (e: any) => toast({ title: "Error", description: String(e?.message ?? "Failed to save API key"), variant: "destructive" }),
+  });
+
+  const clearOpenRouterApiKey = useMutation({
+    mutationFn: async () => {
+      const r = await apiRequest("DELETE", `/api/tenants/${tid}/openrouter/api-key`);
+      return readJsonOrApiHint<{ ok: boolean; configured: boolean }>(r);
+    },
+    onSuccess: () => {
+      setOpenRouterApiKey("");
+      queryClient.invalidateQueries({ queryKey: ["/api/tenants", tid, "openrouter", "api-key"] });
+      toast({ title: "OpenRouter API key cleared" });
+    },
+    onError: (e: any) => toast({ title: "Error", description: String(e?.message ?? "Failed to clear API key"), variant: "destructive" }),
   });
 
   return (
@@ -254,24 +322,93 @@ export default function Settings() {
             <Key className="w-4 h-4 text-accent" /> API Keys
           </CardTitle>
           <CardDescription className="text-xs">
-            OpenRouter key is set on the server via <span className="font-mono">OPENROUTER_API_KEY</span>. Ollama URL is saved under Organization above.
+            API keys are stored server-side for this organization. Keys are not shown again after saving.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
-          {[
-            { label: "OpenRouter API Key", placeholder: "sk-or-v1-...", testId: "openrouter", password: true as const },
-          ].map((k) => (
-            <div key={k.label}>
-              <Label className="text-xs">{k.label}</Label>
-              <Input
-                type={k.password ? "password" : "text"}
-                placeholder={k.placeholder}
-                className="mt-1 font-mono text-xs"
-                data-testid={`api-key-${k.testId}`}
-              />
+          <div>
+            <div className="flex items-center justify-between">
+              <Label className="text-xs">OpenRouter API Key</Label>
+              {openRouterKeyStatus ? (
+                <Badge variant="outline" className="text-[10px] py-0 h-5">
+                  {openRouterKeyStatus.configured ? "configured" : "not set"}
+                </Badge>
+              ) : null}
             </div>
-          ))}
-          <Button variant="outline" size="sm" className="mt-2">Save API Keys</Button>
+            <Input
+              type="password"
+              placeholder="sk-or-..."
+              className="mt-1 font-mono text-xs"
+              value={openRouterApiKey}
+              onChange={(e) => setOpenRouterApiKey(e.target.value)}
+              data-testid="api-key-openrouter"
+            />
+            <p className="text-[11px] text-muted-foreground mt-1">
+              Used when an agent is routed to <span className="font-mono">openrouter</span>.
+            </p>
+            <div className="flex gap-2 mt-2">
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={saveOpenRouterApiKey.isPending || tid <= 0 || !openRouterApiKey.trim()}
+                onClick={() => saveOpenRouterApiKey.mutate()}
+                data-testid="save-openrouter-api-key"
+              >
+                {saveOpenRouterApiKey.isPending ? "Saving…" : "Save"}
+              </Button>
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={clearOpenRouterApiKey.isPending || tid <= 0 || !(openRouterKeyStatus?.configured)}
+                onClick={() => clearOpenRouterApiKey.mutate()}
+                data-testid="clear-openrouter-api-key"
+              >
+                {clearOpenRouterApiKey.isPending ? "Clearing…" : "Clear"}
+              </Button>
+            </div>
+          </div>
+
+          <div>
+            <div className="flex items-center justify-between">
+              <Label className="text-xs">Ollama Cloud API Key</Label>
+              {ollamaKeyStatus ? (
+                <Badge variant="outline" className="text-[10px] py-0 h-5">
+                  {ollamaKeyStatus.configured ? "configured" : "not set"}
+                </Badge>
+              ) : null}
+            </div>
+            <Input
+              type="password"
+              placeholder="ollama_api_key..."
+              className="mt-1 font-mono text-xs"
+              value={ollamaApiKey}
+              onChange={(e) => setOllamaApiKey(e.target.value)}
+              data-testid="api-key-ollama"
+            />
+            <p className="text-[11px] text-muted-foreground mt-1">
+              Used only for cloud-backed models (e.g. <span className="font-mono">*:cloud</span>). Stored in the server DB for this org.
+            </p>
+            <div className="flex gap-2 mt-2">
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={saveOllamaApiKey.isPending || tid <= 0 || !ollamaApiKey.trim()}
+                onClick={() => saveOllamaApiKey.mutate()}
+                data-testid="save-ollama-api-key"
+              >
+                {saveOllamaApiKey.isPending ? "Saving…" : "Save"}
+              </Button>
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={clearOllamaApiKey.isPending || tid <= 0 || !(ollamaKeyStatus?.configured)}
+                onClick={() => clearOllamaApiKey.mutate()}
+                data-testid="clear-ollama-api-key"
+              >
+                {clearOllamaApiKey.isPending ? "Clearing…" : "Clear"}
+              </Button>
+            </div>
+          </div>
         </CardContent>
       </Card>
 

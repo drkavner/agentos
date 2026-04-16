@@ -200,7 +200,7 @@ export default function Dashboard() {
                       <Badge variant="outline" className="text-xs py-0 h-4">{m.messageType}</Badge>
                     )}
                   </div>
-                  <p className="text-muted-foreground leading-relaxed">{m.content}</p>
+                  <p className="text-muted-foreground leading-relaxed whitespace-pre-wrap">{m.content.length > 300 ? m.content.slice(0, 300) + "…" : m.content}</p>
                 </div>
               ))}
               {messages.length === 0 && (

@@ -1,4 +1,4 @@
-# Finance Ops CFO — Skills
+# 💸 Finance Ops CFO — SKILLS
 
 ## Summary
 CFO briefing, cost estimator, scenario modeler
@@ -9,7 +9,7 @@ Marketing Ops
 ## Skills
 - AI CFO that finds hidden costs in 30 minutes
 
-## When to use
+## When to Use
 Cost auditing and financial scenario modeling
 
 ## Source

@@ -1,4 +1,4 @@
-# Whimsy Injector — Skills
+# ✨ Whimsy Injector — SKILLS
 
 ## Summary
 Adds joy, micro-interactions, Easter eggs, and brand personality
@@ -11,7 +11,7 @@ Design
 - delight
 - playful interactions
 
-## When to use
+## When to Use
 Adding joy, micro-interactions, Easter eggs, brand personality
 
 ## Source

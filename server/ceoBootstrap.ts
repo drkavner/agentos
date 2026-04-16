@@ -3,6 +3,7 @@ import { storage } from "./storage";
 import { ensureAgentDefinitionsCatalog } from "./agentDefinitionsCatalog";
 import { upsertAgentRuntimeSettings } from "./agentConfiguration";
 import { auditAndInvalidate } from "./realtimeSideEffects";
+import { getCeoControlSettings } from "./ceoControl";
 
 const DEFAULT_CEO_FILES: Record<string, string> = {
   "AGENTS.md": `You are the CEO. Your job is to lead the company, not to do individual contributor work.\nYou own strategy, prioritization, and cross-functional coordination.\n\n## Delegation (critical)\nYou MUST delegate work rather than doing it yourself.\n\nRouting rules:\n- Code, bugs, features, infra, devtools → CTO\n- Marketing, content, social media, growth, devrel → CMO\n- UX, design, user research, design-system → UXDesigner\n`,
@@ -18,7 +19,14 @@ const DEFAULT_CEO_FILES: Record<string, string> = {
 export function createDefaultCeoForTenant(
   tenantId: number,
   tenantName: string,
-  opts?: { agentHiredDetail?: string; filesDetail?: string },
+  opts?: {
+    agentHiredDetail?: string;
+    filesDetail?: string;
+    llmProvider?: "openrouter" | "ollama";
+    model?: string;
+    adapterType?: "hermes" | "openclaw" | "cli";
+    command?: string;
+  },
 ) {
   ensureAgentDefinitionsCatalog();
   const defs = storage.getAgentDefinitions();
@@ -26,12 +34,14 @@ export function createDefaultCeoForTenant(
     throw new Error("Agent definition catalog is still empty after ensureAgentDefinitionsCatalog()");
   }
   const orchestrator = defs.find((d) => d.name === "Agents Orchestrator") ?? defs[0]!;
+  const llmProvider = opts?.llmProvider ?? "openrouter";
+  const model = opts?.model ?? "anthropic/claude-sonnet-4";
   const ceoParsed = insertAgentSchema.safeParse({
     tenantId,
     definitionId: orchestrator.id,
     displayName: "CEO",
     role: "CEO",
-    model: "claude-3-5-sonnet",
+    model,
     monthlyBudget: 200,
     status: "running",
     goal: `Lead ${tenantName} and orchestrate all teams toward the mission.`,
@@ -41,8 +51,17 @@ export function createDefaultCeoForTenant(
     throw new Error(`CEO validation failed: ${JSON.stringify(ceoParsed.error?.issues ?? ceoParsed.error)}`);
   }
   const ceo = storage.createAgent(ceoParsed.data);
+  // Prevent an immediate scheduled heartbeat right after org creation (e.g. at :00 or :30),
+  // which can unexpectedly complete the starter task before the user even sees it in To Do.
+  try {
+    storage.updateAgent(ceo.id, { lastHeartbeat: new Date().toISOString() });
+  } catch {
+    // ignore
+  }
   upsertAgentRuntimeSettings(ceo.id, {
-    llmProvider: "openrouter",
+    llmProvider,
+    adapterType: opts?.adapterType ?? "hermes",
+    command: opts?.command ?? "",
     bypassSandbox: true,
     heartbeatEnabled: true,
     wakeOnDemand: true,
@@ -87,6 +106,8 @@ export function repairAllTenantsMissingCeo() {
     return;
   }
   for (const t of storage.getTenants()) {
+    const settings = getCeoControlSettings(t.id);
+    if (settings.enabled === false) continue;
     const agents = storage.getAgents(t.id);
     const hasCeo = agents.some((a) => String(a.role).toLowerCase() === "ceo");
     if (hasCeo) continue;

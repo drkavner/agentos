@@ -1,4 +1,4 @@
-# SEO Specialist — Skills
+# 🔍 SEO Specialist — SKILLS
 
 ## Summary
 Drives organic search growth and improves discoverability
@@ -11,7 +11,7 @@ Marketing
 - content strategy
 - link building
 
-## When to use
+## When to Use
 Driving sustainable organic search growth
 
 ## Source

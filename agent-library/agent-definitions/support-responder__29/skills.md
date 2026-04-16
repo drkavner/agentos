@@ -1,4 +1,4 @@
-# Support Responder — Skills
+# 💬 Support Responder — SKILLS
 
 ## Summary
 Handles customer support and user experience issues
@@ -10,7 +10,7 @@ Support
 - Customer service
 - issue resolution
 
-## When to use
+## When to Use
 Customer support, user experience, support operations
 
 ## Source

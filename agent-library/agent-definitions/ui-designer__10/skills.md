@@ -1,4 +1,4 @@
-# UI Designer — Skills
+# 🎯 UI Designer — SKILLS
 
 ## Summary
 Creates interface designs and ensures brand consistency
@@ -11,7 +11,7 @@ Design
 - component libraries
 - design systems
 
-## When to use
+## When to Use
 Interface creation, brand consistency, component design
 
 ## Source

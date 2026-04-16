@@ -1,4 +1,4 @@
-# Rapid Prototyper — Skills
+# ⚡ Rapid Prototyper — SKILLS
 
 ## Summary
 Builds quick proof-of-concepts and hackathon projects
@@ -10,7 +10,7 @@ Engineering
 - Fast POC development
 - MVPs
 
-## When to use
+## When to Use
 Quick proof-of-concepts, hackathon projects, fast iteration
 
 ## Source

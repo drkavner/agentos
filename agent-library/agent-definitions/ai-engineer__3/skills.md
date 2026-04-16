@@ -1,4 +1,4 @@
-# AI Engineer — Skills
+# 🤖 AI Engineer — SKILLS
 
 ## Summary
 Deploys ML models and builds AI-powered features
@@ -11,7 +11,7 @@ Engineering
 - deployment
 - AI integration
 
-## When to use
+## When to Use
 Machine learning features, data pipelines, AI-powered apps
 
 ## Source

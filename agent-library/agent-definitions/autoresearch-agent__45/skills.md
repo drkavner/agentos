@@ -1,4 +1,4 @@
-# Autoresearch Agent — Skills
+# 🔬 Autoresearch Agent — SKILLS
 
 ## Summary
 Generates 50+ variants, runs expert scoring, evolves winners
@@ -9,7 +9,7 @@ Marketing Ops
 ## Skills
 - Karpathy-inspired optimization loops for conversion content
 
-## When to use
+## When to Use
 Conversion content optimization with evolutionary loops
 
 ## Source

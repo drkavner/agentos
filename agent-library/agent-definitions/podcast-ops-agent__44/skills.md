@@ -1,4 +1,4 @@
-# Podcast Ops Agent — Skills
+# 🎙️ Podcast Ops Agent — SKILLS
 
 ## Summary
 Transforms podcast episodes into full multi-platform content calendars
@@ -9,7 +9,7 @@ Marketing Ops
 ## Skills
 - One episode → 20+ content pieces across every platform
 
-## When to use
+## When to Use
 Podcast content repurposing across platforms
 
 ## Source

@@ -1,4 +1,4 @@
-# Feedback Synthesizer — Skills
+# 💬 Feedback Synthesizer — SKILLS
 
 ## Summary
 Analyzes user feedback and extracts product priorities
@@ -10,7 +10,7 @@ Product
 - User feedback analysis
 - insights extraction
 
-## When to use
+## When to Use
 Feedback analysis, user insights, product priorities
 
 ## Source

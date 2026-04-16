@@ -1,4 +1,4 @@
-# Backend Architect — Skills
+# 🏗️ Backend Architect — SKILLS
 
 ## Summary
 Designs server-side systems, microservices, and cloud infrastructure
@@ -11,7 +11,7 @@ Engineering
 - database architecture
 - scalability
 
-## When to use
+## When to Use
 Server-side systems, microservices, cloud infrastructure
 
 ## Source

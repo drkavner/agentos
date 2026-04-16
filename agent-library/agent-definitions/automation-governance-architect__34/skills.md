@@ -1,4 +1,4 @@
-# Automation Governance Architect — Skills
+# ⚙️ Automation Governance Architect — SKILLS
 
 ## Summary
 Evaluates and governs business automations at scale
@@ -11,7 +11,7 @@ Specialized
 - n8n
 - workflow auditing
 
-## When to use
+## When to Use
 Evaluating and governing business automations at scale
 
 ## Source

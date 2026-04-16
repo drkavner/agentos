@@ -1,4 +1,4 @@
-# AI Citation Strategist — Skills
+# 🔮 AI Citation Strategist — SKILLS
 
 ## Summary
 Improves brand visibility across ChatGPT, Claude, Gemini, Perplexity
@@ -11,7 +11,7 @@ Marketing
 - AI recommendation visibility
 - citation auditing
 
-## When to use
+## When to Use
 Improving AI recommendation visibility and citation auditing
 
 ## Source

@@ -1,4 +1,4 @@
-# Security Engineer — Skills
+# 🔒 Security Engineer — SKILLS
 
 ## Summary
 Performs security audits and vulnerability assessments
@@ -11,7 +11,7 @@ Engineering
 - secure code review
 - security architecture
 
-## When to use
+## When to Use
 Application security, vulnerability assessment, security CI/CD
 
 ## Source

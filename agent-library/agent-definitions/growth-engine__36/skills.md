@@ -1,4 +1,4 @@
-# Growth Engine — Skills
+# 📈 Growth Engine — SKILLS
 
 ## Summary
 Runs autonomous growth experiments with pacing alerts and weekly scorecards
@@ -11,7 +11,7 @@ Marketing Ops
 - measure
 - and optimize
 
-## When to use
+## When to Use
 Autonomous marketing experiments and growth optimization
 
 ## Source

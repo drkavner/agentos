@@ -46,7 +46,12 @@ export function CeoShell({
     if (!ceo) return [];
     return audit
       .filter((r) => r.agentId === ceo.id)
-      .filter((r) => r.action === "hermes_run_once" || r.action === "heartbeat")
+      .filter((r) =>
+        r.action === "hermes_run_once" ||
+        r.action === "openclaw_run_once" ||
+        r.action === "heartbeat" ||
+        r.action === "agent_run_failed"
+      )
       .slice()
       .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
   }, [audit, ceo]);
@@ -136,7 +141,7 @@ export function CeoShell({
           </Button>
 
           <Badge variant="outline" className="text-xs py-0 h-7">
-            {latestRun ? "ok" : "error"}
+            {!ceo ? "disabled" : latestRun?.action === "agent_run_failed" ? "error" : latestRun ? "ok" : "—"}
           </Badge>
 
           {rightSlot}
@@ -162,7 +167,13 @@ export function CeoShell({
         })}
       </div>
 
-      {children}
+      {!ceo ? (
+        <div className="rounded-lg border border-border bg-card/30 p-4 text-sm text-muted-foreground">
+          CEO agent is disabled or not created for this organization. You can still hire and run other agents normally.
+        </div>
+      ) : (
+        children
+      )}
     </div>
   );
 }
@@ -189,24 +200,31 @@ export function LatestRunSummary() {
     if (!ceo) return null;
     return audit
       .filter((r) => r.agentId === ceo.id)
-      .filter((r) => r.action === "hermes_run_once" || r.action === "heartbeat")
+      .filter((r) =>
+        r.action === "hermes_run_once" ||
+        r.action === "openclaw_run_once" ||
+        r.action === "heartbeat" ||
+        r.action === "agent_run_failed"
+      )
       .slice()
       .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))[0] ?? null;
   }, [audit, ceo]);
 
   return (
     <div className="text-xs text-muted-foreground inline-flex items-center gap-2">
-      <XCircle className={cn("w-3.5 h-3.5", latest ? "text-muted-foreground" : "text-destructive")} />
+      <XCircle className={cn("w-3.5 h-3.5", latest?.action === "agent_run_failed" ? "text-destructive" : "text-muted-foreground")} />
       <span className="inline-flex items-center gap-1">
         <Badge
           variant="outline"
-          className={cn("text-xs py-0", latest ? "" : "border-destructive/40 text-destructive")}
+          className={cn("text-xs py-0", latest?.action === "agent_run_failed" ? "border-destructive/40 text-destructive" : "")}
         >
-          {latest ? "ok" : "failed"}
+          {latest?.action === "agent_run_failed" ? "failed" : latest ? "ok" : "—"}
         </Badge>
       </span>
       <span className="font-mono">{latest?.id ?? "—"}</span>
-      <Badge variant="outline" className="text-[10px] py-0">on-demand</Badge>
+      <Badge variant="outline" className="text-[10px] py-0">
+        {latest?.action === "heartbeat" ? "heartbeat" : latest ? "on-demand" : "—"}
+      </Badge>
       <Link href="/ceo/runs">
         <a className="text-xs text-muted-foreground hover:text-foreground inline-flex items-center gap-1 ml-2">
           View details <ChevronRight className="w-3.5 h-3.5" />
