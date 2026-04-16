@@ -1357,6 +1357,138 @@ export async function registerRoutes(httpServer: Server, app: Express) {
     res.json({ ok: true });
   });
 
+  // ─── Task Approval / Rejection ──────────────────────────────────────────
+
+  app.post("/api/tasks/:id/approve", (req, res) => {
+    const id = Number(req.params.id);
+    const task = storage.getTask(id);
+    if (!task) throw new ApiError(404, "not_found", "Task not found");
+    if (task.status !== "review") throw new ApiError(400, "invalid_status", "Task is not in review status");
+
+    storage.updateTask(id, { status: "done", completedAt: new Date().toISOString() } as any);
+    auditAndInvalidate(task.tenantId, ["tasks", "goals"], {
+      agentId: task.assignedAgentId ?? undefined,
+      action: "task_approved",
+      entity: "task",
+      entityId: String(id),
+      detail: `Approved: ${task.title}`,
+      tokensUsed: 0,
+      cost: 0,
+    });
+
+    maybeAutoCloseParentCeoTask({ ...task, status: "done" } as any);
+    res.json({ ok: true, task: storage.getTask(id) });
+  });
+
+  app.post("/api/tasks/:id/reject", async (req, res) => {
+    const id = Number(req.params.id);
+    const task = storage.getTask(id);
+    if (!task) throw new ApiError(404, "not_found", "Task not found");
+    if (task.status !== "review") throw new ApiError(400, "invalid_status", "Task is not in review status");
+
+    const feedback = (req.body?.feedback ?? "").trim();
+
+    storage.updateTask(id, { status: "in_progress" } as any);
+    auditAndInvalidate(task.tenantId, ["tasks", "goals"], {
+      agentId: task.assignedAgentId ?? undefined,
+      action: "task_rejected",
+      entity: "task",
+      entityId: String(id),
+      detail: `Changes requested: ${task.title}${feedback ? ` — "${feedback}"` : ""}`,
+      tokensUsed: 0,
+      cost: 0,
+    });
+
+    if (feedback) {
+      const description = task.description ?? "";
+      const updatedDesc = `${description}\n\n--- Reviewer Feedback ---\n${feedback}`;
+      storage.updateTask(id, { description: updatedDesc } as any);
+    }
+
+    if (task.assignedAgentId) {
+      void (async () => {
+        try {
+          await dispatchAgentRun(task.tenantId, task.assignedAgentId!, {
+            reason: "manual",
+            bypassCooldown: true,
+          });
+        } catch { /* best-effort */ }
+      })();
+    }
+
+    res.json({ ok: true, task: storage.getTask(id) });
+  });
+
+  // ─── Task Detail (messages + runs for a specific task) ──────────────────
+  app.get("/api/tenants/:tenantId/tasks/:taskId/detail", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const taskId = Number(req.params.taskId);
+    const task = storage.getTask(taskId);
+    if (!task || task.tenantId !== tenantId) throw new ApiError(404, "not_found", "Task not found");
+
+    const agentId = task.assignedAgentId;
+    const agent = agentId ? storage.getAgent(agentId) : null;
+
+    // Collect channels: general + any team channels the agent belongs to
+    const channelSet = new Set(["general"]);
+    if (task.teamId) channelSet.add(`team-${task.teamId}`);
+    if (agentId) {
+      const teams = storage.getTeams(tenantId);
+      for (const team of teams) {
+        const members = storage.getTeamMembers(team.id);
+        if (members.some((m: any) => m.agentId === agentId)) {
+          channelSet.add(`team-${team.id}`);
+        }
+      }
+    }
+
+    // Gather messages from this agent, prioritizing task-specific ones
+    const taskMessages: any[] = [];
+    const parentId = task.parentTaskId;
+    const taskTitle = task.title;
+    for (const ch of Array.from(channelSet)) {
+      const msgs = storage.getMessages(tenantId, ch);
+      for (const m of msgs) {
+        if (!agentId || m.senderAgentId !== agentId) continue;
+        const meta = typeof m.metadata === "string" ? (() => { try { return JSON.parse(m.metadata || "{}"); } catch { return {}; } })() : (m.metadata ?? {});
+        const isTaskRelated = meta.taskId === taskId || meta.taskId === parentId;
+        // Also match messages posted during/after this task was created
+        const isAfterTaskCreation = new Date(m.createdAt) >= new Date(task.createdAt);
+        if (isTaskRelated || isAfterTaskCreation) {
+          taskMessages.push(m);
+        }
+      }
+    }
+
+    // Deduplicate and sort by id, take most recent
+    const uniqueMsgs = taskMessages
+      .filter((m, i, arr) => arr.findIndex((x) => x.id === m.id) === i)
+      .sort((a, b) => b.id - a.id)
+      .slice(0, 20)
+      .reverse();
+
+    // Get recent runs for this agent, with events
+    const rawRuns = agentId ? listAgentRuns(tenantId, agentId).slice(0, 5) : [];
+    const runs = rawRuns.map((r) => ({
+      ...r,
+      events: getRunEvents(r.id),
+    }));
+
+    // Get child tasks if this is a parent
+    const allTasks = storage.getTasks(tenantId);
+    const children = allTasks.filter(
+      (t) => t.parentTaskId === taskId || String(t.description ?? "").includes(`parentTaskId:${taskId}`),
+    );
+
+    res.json({
+      task,
+      agent: agent ? { id: agent.id, displayName: agent.displayName, role: agent.role } : null,
+      messages: uniqueMsgs,
+      runs,
+      children,
+    });
+  });
+
   // ─── Deliverables ────────────────────────────────────────────────────────
   app.get("/api/tenants/:tenantId/tasks/:taskId/deliverables", (req, res) => {
     const tenantId = Number(req.params.tenantId);

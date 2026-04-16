@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, useCallback } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import type { Task, Agent, Team } from "@shared/schema";
@@ -11,8 +11,11 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
-import { Plus, CheckSquare, AlertTriangle, Clock, Loader, Eye, Trash2 } from "lucide-react";
+import { Plus, CheckSquare, AlertTriangle, Clock, Loader, Eye, Trash2, ThumbsUp, MessageSquareWarning, Send, Download, FileCode, Copy, User, Activity, GitBranch, ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { Textarea as TextareaBase } from "@/components/ui/textarea";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useToast } from "@/hooks/use-toast";
 import { useForm } from "react-hook-form";
 import { Form, FormControl, FormField, FormItem, FormLabel } from "@/components/ui/form";
@@ -46,30 +49,401 @@ const PRIORITY_CONFIG: Record<string, string> = {
   low: "text-muted-foreground border-muted",
 };
 
+// ─── Rendered code block (shared with Collab.tsx) ───────────────────────────
+function CodeBlock({ lang, code }: { lang: string; code: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <div className="relative rounded-md border border-border bg-black/40 text-xs overflow-hidden my-2">
+      <div className="flex items-center justify-between px-3 py-1 bg-muted/30 border-b border-border">
+        <span className="text-muted-foreground text-[10px] font-mono">{lang || "code"}</span>
+        <button
+          className="text-muted-foreground hover:text-foreground transition-colors"
+          onClick={() => { navigator.clipboard.writeText(code); setCopied(true); setTimeout(() => setCopied(false), 1500); }}
+        >
+          {copied ? <CheckSquare className="w-3 h-3 text-green-400" /> : <Copy className="w-3 h-3" />}
+        </button>
+      </div>
+      <pre className="p-3 overflow-x-auto text-foreground/90 leading-relaxed"><code>{code}</code></pre>
+    </div>
+  );
+}
+
+function RenderContent({ content }: { content: string }) {
+  const parts: { type: "text" | "code"; lang?: string; value: string }[] = [];
+  const lines = content.split("\n");
+  let inCode = false;
+  let codeLang = "";
+  let codeLines: string[] = [];
+
+  for (const line of lines) {
+    if (!inCode && line.startsWith("```")) {
+      inCode = true;
+      codeLang = line.slice(3).trim();
+      codeLines = [];
+    } else if (inCode && line.startsWith("```")) {
+      parts.push({ type: "code", lang: codeLang, value: codeLines.join("\n") });
+      inCode = false;
+    } else if (inCode) {
+      codeLines.push(line);
+    } else {
+      const last = parts[parts.length - 1];
+      if (last?.type === "text") {
+        last.value += "\n" + line;
+      } else {
+        parts.push({ type: "text", value: line });
+      }
+    }
+  }
+  if (inCode && codeLines.length > 0) {
+    parts.push({ type: "code", lang: codeLang, value: codeLines.join("\n") });
+  }
+
+  return (
+    <div>
+      {parts.map((p, i) =>
+        p.type === "code" ? (
+          <CodeBlock key={i} lang={p.lang ?? ""} code={p.value} />
+        ) : (
+          <div key={i} className="text-sm text-foreground/90 whitespace-pre-wrap leading-relaxed">
+            {p.value.split("\n").map((line, j) => {
+              if (line.match(/^#{1,3}\s/)) {
+                const level = line.match(/^(#+)/)![1].length;
+                const text = line.replace(/^#+\s*/, "");
+                const cls = level === 1 ? "text-base font-bold mt-3 mb-1" : level === 2 ? "text-sm font-semibold mt-2 mb-1" : "text-sm font-medium mt-1.5";
+                return <div key={j} className={cls}>{text}</div>;
+              }
+              if (line.match(/^[-*]\s/)) {
+                return <div key={j} className="pl-3 flex gap-1.5"><span className="text-muted-foreground">•</span><span>{line.replace(/^[-*]\s/, "")}</span></div>;
+              }
+              if (line.trim() === "") return <div key={j} className="h-2" />;
+              return <div key={j}>{line}</div>;
+            })}
+          </div>
+        ),
+      )}
+    </div>
+  );
+}
+
+// ─── Task Detail Modal ──────────────────────────────────────────────────────
+function TaskDetailModal({
+  taskId,
+  tenantId,
+  agents,
+  open,
+  onClose,
+  onApprove,
+  onReject,
+}: {
+  taskId: number;
+  tenantId: number;
+  agents: Agent[];
+  open: boolean;
+  onClose: () => void;
+  onApprove: (id: number) => void;
+  onReject: (id: number) => void;
+}) {
+  const { data, isLoading } = useQuery<{
+    task: Task;
+    agent: { id: number; displayName: string; role: string } | null;
+    messages: any[];
+    runs: any[];
+    children: Task[];
+  }>({
+    queryKey: ["/api/tenants", tenantId, "tasks", taskId, "detail"],
+    queryFn: () => apiRequest("GET", `/api/tenants/${tenantId}/tasks/${taskId}/detail`).then((r) => r.json()),
+    enabled: open && taskId > 0,
+    refetchInterval: open ? 8000 : false,
+  });
+
+  const { data: deliverables } = useQuery<{ items: { name: string; size: number }[] }>({
+    queryKey: ["/api/tenants", tenantId, "tasks", taskId, "deliverables"],
+    queryFn: () => apiRequest("GET", `/api/tenants/${tenantId}/tasks/${taskId}/deliverables`).then((r) => r.json()),
+    enabled: open && taskId > 0,
+  });
+
+  const task = data?.task;
+  const agent = data?.agent;
+  const msgs = data?.messages ?? [];
+  const children = data?.children ?? [];
+  const files = deliverables?.items ?? [];
+  const isReview = task?.status === "review";
+
+  const handleDownload = useCallback(async () => {
+    const resp = await fetch(`/api/tenants/${tenantId}/tasks/${taskId}/deliverables/download`);
+    if (!resp.ok) return;
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `task-${taskId}.zip`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [tenantId, taskId]);
+
+  const sc = task ? STATUS_CONFIG[task.status as Status] : null;
+
+  const runs = data?.runs ?? [];
+
+  return (
+    <Dialog open={open} onOpenChange={(v) => { if (!v) onClose(); }}>
+      <DialogContent className="max-w-3xl p-0 gap-0 overflow-hidden" style={{ height: "85vh", display: "flex", flexDirection: "column" }}>
+        {isLoading || !task ? (
+          <div className="flex items-center justify-center py-20">
+            <Loader className="w-5 h-5 animate-spin text-muted-foreground" />
+          </div>
+        ) : (
+          <>
+            {/* Fixed Header */}
+            <div className="px-6 pt-5 pb-4 border-b border-border flex-shrink-0">
+              <div className="flex items-start justify-between gap-4">
+                <div className="flex-1 min-w-0">
+                  <h2 className="text-base font-semibold text-foreground leading-tight">{task.title}</h2>
+                  <div className="flex items-center gap-2 mt-2 flex-wrap">
+                    {sc && (
+                      <Badge variant="outline" className={cn("text-xs", sc.color)}>
+                        <sc.icon className="w-3 h-3 mr-1" />
+                        {sc.label}
+                      </Badge>
+                    )}
+                    <Badge variant="outline" className={cn("text-xs", PRIORITY_CONFIG[task.priority])}>
+                      {task.priority}
+                    </Badge>
+                    {agent && (
+                      <div className="flex items-center gap-1 text-xs text-muted-foreground">
+                        <User className="w-3 h-3" />
+                        {agent.displayName} ({agent.role})
+                      </div>
+                    )}
+                  </div>
+                </div>
+                {isReview && (
+                  <div className="flex gap-2 flex-shrink-0">
+                    <Button size="sm" variant="outline" className="border-green-500/30 text-green-400 hover:bg-green-500/10 hover:text-green-300" onClick={() => onApprove(task.id)}>
+                      <ThumbsUp className="w-3.5 h-3.5 mr-1" /> Approve
+                    </Button>
+                    <Button size="sm" variant="outline" className="border-orange-500/30 text-orange-400 hover:bg-orange-500/10 hover:text-orange-300" onClick={() => { onClose(); onReject(task.id); }}>
+                      <MessageSquareWarning className="w-3.5 h-3.5 mr-1" /> Request Changes
+                    </Button>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Tabs + scrollable body */}
+            <Tabs defaultValue="output" className="flex-1 flex flex-col min-h-0">
+              <div className="px-6 pt-3 pb-0 flex-shrink-0">
+                <TabsList className="bg-muted/40 w-fit">
+                  <TabsTrigger value="output" className="text-xs">Agent Output</TabsTrigger>
+                  <TabsTrigger value="logs" className="text-xs">Logs ({runs.length})</TabsTrigger>
+                  {files.length > 0 && <TabsTrigger value="files" className="text-xs">Files ({files.length})</TabsTrigger>}
+                  {children.length > 0 && <TabsTrigger value="subtasks" className="text-xs">Sub-tasks ({children.length})</TabsTrigger>}
+                  <TabsTrigger value="info" className="text-xs">Details</TabsTrigger>
+                </TabsList>
+              </div>
+
+              <div className="flex-1 min-h-0 overflow-y-auto">
+                <div className="px-6 py-4">
+
+                  {/* ── Output tab ─────────────────────────────── */}
+                  <TabsContent value="output" className="mt-0 space-y-4">
+                    {msgs.length === 0 ? (
+                      <div className="text-center py-12 text-muted-foreground text-sm">
+                        <Activity className="w-8 h-8 mx-auto mb-3 opacity-40" />
+                        {task.status === "todo" || task.status === "in_progress"
+                          ? "Agent is still working on this task..."
+                          : "No output recorded for this task."}
+                      </div>
+                    ) : (
+                      msgs.map((m) => (
+                        <div key={m.id} className="border border-border rounded-lg overflow-hidden">
+                          <div className="flex items-center gap-2 px-3 py-2 bg-muted/30 border-b border-border">
+                            <span className="text-sm">{m.senderEmoji ?? "🤖"}</span>
+                            <span className="text-xs font-medium text-foreground">{m.senderName}</span>
+                            <span className="text-[10px] text-muted-foreground ml-auto">
+                              {new Date(m.createdAt).toLocaleString()}
+                            </span>
+                          </div>
+                          <div className="px-3 py-3">
+                            {m.content.includes("```") ? (
+                              <RenderContent content={m.content} />
+                            ) : (
+                              <p className="text-sm text-foreground/90 whitespace-pre-wrap leading-relaxed">{m.content}</p>
+                            )}
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </TabsContent>
+
+                  {/* ── Logs tab ───────────────────────────────── */}
+                  <TabsContent value="logs" className="mt-0 space-y-3">
+                    {runs.length === 0 ? (
+                      <div className="text-center py-12 text-muted-foreground text-sm">
+                        <Activity className="w-8 h-8 mx-auto mb-3 opacity-40" />
+                        No runs recorded yet.
+                      </div>
+                    ) : (
+                      runs.map((r: any) => {
+                        const events: any[] = r.events ?? [];
+                        const statusColor = r.status === "ok" ? "text-green-400" : r.status === "running" ? "text-blue-400" : "text-destructive";
+                        const statusBg = r.status === "ok" ? "bg-green-400/5 border-green-500/20" : r.status === "running" ? "bg-blue-400/5 border-blue-500/20" : "bg-destructive/5 border-destructive/20";
+                        return (
+                          <div key={r.id} className={cn("border rounded-lg overflow-hidden", statusBg)}>
+                            <div className="flex items-center gap-2 px-3 py-2 bg-muted/20 border-b border-border">
+                              <Activity className={cn("w-3.5 h-3.5", statusColor)} />
+                              <span className="text-xs font-medium text-foreground">Run #{r.id}</span>
+                              <Badge variant="outline" className={cn("text-[10px] py-0 h-4", statusColor)}>{r.status}</Badge>
+                              <span className="text-[10px] text-muted-foreground">{r.trigger}</span>
+                              {r.durationMs && <span className="text-[10px] text-muted-foreground ml-auto">{(r.durationMs / 1000).toFixed(1)}s</span>}
+                              {!r.durationMs && r.startedAt && <span className="text-[10px] text-muted-foreground ml-auto">{new Date(r.startedAt).toLocaleString()}</span>}
+                            </div>
+                            {r.summary && (
+                              <div className="px-3 py-1.5 text-xs text-foreground/80 border-b border-border bg-muted/10">{r.summary}</div>
+                            )}
+                            {r.error && (
+                              <div className="px-3 py-1.5 text-xs text-destructive border-b border-border bg-destructive/5">{r.error}</div>
+                            )}
+                            {events.length > 0 && (
+                              <div className="px-3 py-2 space-y-1">
+                                {events.map((e: any, ei: number) => {
+                                  const kindColor = e.kind === "stderr" ? "text-destructive" : e.kind === "event" ? "text-blue-400" : e.kind === "system" ? "text-muted-foreground" : "text-foreground/70";
+                                  return (
+                                    <div key={ei} className="flex items-start gap-2 text-[11px] font-mono leading-relaxed">
+                                      <span className={cn("flex-shrink-0 w-12 text-right", kindColor)}>[{e.kind}]</span>
+                                      <span className="text-foreground/70 break-all">{e.message}</span>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })
+                    )}
+                  </TabsContent>
+
+                  {/* ── Files tab ──────────────────────────────── */}
+                  <TabsContent value="files" className="mt-0">
+                    <div className="space-y-2">
+                      {files.map((f, i) => (
+                        <div key={i} className="flex items-center gap-3 px-3 py-2 rounded-lg border border-border bg-muted/20">
+                          <FileCode className="w-4 h-4 text-primary flex-shrink-0" />
+                          <span className="text-sm text-foreground font-mono flex-1 truncate">{f.name}</span>
+                          <span className="text-xs text-muted-foreground">{f.size > 1024 ? `${(f.size / 1024).toFixed(1)} KB` : `${f.size} B`}</span>
+                        </div>
+                      ))}
+                      <Button size="sm" variant="outline" className="mt-3" onClick={handleDownload}>
+                        <Download className="w-3.5 h-3.5 mr-1" /> Download All (.zip)
+                      </Button>
+                    </div>
+                  </TabsContent>
+
+                  {/* ── Subtasks tab ───────────────────────────── */}
+                  <TabsContent value="subtasks" className="mt-0">
+                    <div className="space-y-2">
+                      {children.map((c) => {
+                        const cAgent = agents.find((a) => a.id === c.assignedAgentId);
+                        const cSc = STATUS_CONFIG[c.status as Status];
+                        return (
+                          <div key={c.id} className={cn("flex items-center gap-3 px-3 py-2.5 rounded-lg border border-border", cSc?.bg)}>
+                            <cSc.icon className={cn("w-4 h-4 flex-shrink-0", cSc?.color)} />
+                            <div className="flex-1 min-w-0">
+                              <p className="text-sm text-foreground truncate">{c.title}</p>
+                              {cAgent && <p className="text-xs text-muted-foreground">{cAgent.displayName} ({cAgent.role})</p>}
+                            </div>
+                            <Badge variant="outline" className={cn("text-xs flex-shrink-0", cSc?.color)}>
+                              {cSc?.label}
+                            </Badge>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </TabsContent>
+
+                  {/* ── Details tab ────────────────────────────── */}
+                  <TabsContent value="info" className="mt-0 space-y-4">
+                    {task.description && (
+                      <div>
+                        <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1.5">Description</h4>
+                        <p className="text-sm text-foreground/80 whitespace-pre-wrap leading-relaxed bg-muted/20 rounded-lg px-3 py-2 border border-border">
+                          {task.description}
+                        </p>
+                      </div>
+                    )}
+                    <div className="grid grid-cols-2 gap-4">
+                      <div>
+                        <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">Status</h4>
+                        <p className={cn("text-sm font-medium", sc?.color)}>{sc?.label}</p>
+                      </div>
+                      <div>
+                        <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">Priority</h4>
+                        <p className="text-sm font-medium">{task.priority}</p>
+                      </div>
+                      <div>
+                        <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">Assigned To</h4>
+                        <p className="text-sm">{agent ? `${agent.displayName} (${agent.role})` : "Unassigned"}</p>
+                      </div>
+                      <div>
+                        <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">Created</h4>
+                        <p className="text-sm text-muted-foreground">{new Date(task.createdAt).toLocaleString()}</p>
+                      </div>
+                      {task.completedAt && (
+                        <div>
+                          <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">Completed</h4>
+                          <p className="text-sm text-muted-foreground">{new Date(task.completedAt).toLocaleString()}</p>
+                        </div>
+                      )}
+                      {task.parentTaskId && (
+                        <div>
+                          <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">Parent Task</h4>
+                          <p className="text-sm text-muted-foreground">#{task.parentTaskId}</p>
+                        </div>
+                      )}
+                    </div>
+                  </TabsContent>
+
+                </div>
+              </div>
+            </Tabs>
+          </>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ─── Task Card ──────────────────────────────────────────────────────────────
 interface TaskCardProps {
   task: Task;
   agents: Agent[];
   onStatusChange: (id: number, status: string) => void;
   onDelete: (id: number) => void;
+  onApprove?: (id: number) => void;
+  onReject?: (id: number) => void;
+  onOpenDetail?: (id: number) => void;
   dragAttributes?: Record<string, any>;
   dragListeners?: Record<string, any>;
   dragRef?: (node: HTMLElement | null) => void;
   dragStyle?: React.CSSProperties;
 }
 
-function TaskCard({ task, agents, onStatusChange, onDelete, dragAttributes, dragListeners, dragRef, dragStyle }: TaskCardProps) {
+function TaskCard({ task, agents, onStatusChange, onDelete, onApprove, onReject, onOpenDetail, dragAttributes, dragListeners, dragRef, dragStyle }: TaskCardProps) {
   const agent = agents.find(a => a.id === task.assignedAgentId);
   const s = STATUS_CONFIG[task.status as Status];
+  const isReview = task.status === "review";
   return (
     <div
       ref={dragRef}
       style={dragStyle}
       {...dragAttributes}
       {...dragListeners}
+      onClick={() => onOpenDetail?.(task.id)}
       className={cn(
-        "group border border-border rounded-lg p-3 cursor-grab active:cursor-grabbing hover:border-primary/40 transition-all bg-card",
+        "group border border-border rounded-lg p-3 cursor-pointer hover:border-primary/40 transition-all bg-card",
         "touch-none select-none",
         s.bg,
+        isReview && "border-yellow-400/40 ring-1 ring-yellow-400/20",
       )}
       data-testid={`task-${task.id}`}
     >
@@ -107,18 +481,35 @@ function TaskCard({ task, agents, onStatusChange, onDelete, dragAttributes, drag
           {task.goalTag}
         </div>
       )}
-      {/* Status change buttons */}
-      <div className="flex gap-1 mt-2 opacity-0 group-hover:opacity-100 transition-all">
-        {STATUSES.filter(s => s !== task.status).map(ns => (
+
+      {isReview && onApprove && onReject ? (
+        <div className="flex gap-1.5 mt-2.5">
           <button
-            key={ns}
-            onClick={() => onStatusChange(task.id, ns)}
-            className="text-xs px-1.5 py-0.5 rounded bg-muted hover:bg-primary/20 text-muted-foreground hover:text-primary transition-all"
+            onClick={(e) => { e.stopPropagation(); onApprove(task.id); }}
+            className="flex items-center gap-1 text-xs px-2 py-1 rounded-md bg-green-500/10 text-green-400 hover:bg-green-500/25 hover:text-green-300 font-medium transition-all"
           >
-            → {ns.replace("_", " ")}
+            <ThumbsUp className="w-3 h-3" /> Approve
           </button>
-        ))}
-      </div>
+          <button
+            onClick={(e) => { e.stopPropagation(); onReject(task.id); }}
+            className="flex items-center gap-1 text-xs px-2 py-1 rounded-md bg-orange-500/10 text-orange-400 hover:bg-orange-500/25 hover:text-orange-300 font-medium transition-all"
+          >
+            <MessageSquareWarning className="w-3 h-3" /> Request Changes
+          </button>
+        </div>
+      ) : (
+        <div className="flex gap-1 mt-2 opacity-0 group-hover:opacity-100 transition-all">
+          {STATUSES.filter(s => s !== task.status).map(ns => (
+            <button
+              key={ns}
+              onClick={(e) => { e.stopPropagation(); onStatusChange(task.id, ns); }}
+              className="text-xs px-1.5 py-0.5 rounded bg-muted hover:bg-primary/20 text-muted-foreground hover:text-primary transition-all"
+            >
+              → {ns.replace("_", " ")}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -128,6 +519,9 @@ function SortableTaskCard({
   agents,
   onStatusChange,
   onDelete,
+  onApprove,
+  onReject,
+  onOpenDetail,
 }: TaskCardProps) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: `task:${task.id}`,
@@ -144,6 +538,9 @@ function SortableTaskCard({
       agents={agents}
       onStatusChange={onStatusChange}
       onDelete={onDelete}
+      onApprove={onApprove}
+      onReject={onReject}
+      onOpenDetail={onOpenDetail}
       dragAttributes={attributes}
       dragListeners={listeners}
       dragRef={setNodeRef}
@@ -161,6 +558,9 @@ function KanbanColumn({
   agents,
   onStatusChange,
   onDelete,
+  onApprove,
+  onReject,
+  onOpenDetail,
 }: {
   status: Status;
   label: string;
@@ -170,6 +570,9 @@ function KanbanColumn({
   agents: Agent[];
   onStatusChange: (id: number, status: string) => void;
   onDelete: (id: number) => void;
+  onApprove?: (id: number) => void;
+  onReject?: (id: number) => void;
+  onOpenDetail?: (id: number) => void;
 }) {
   const { setNodeRef, isOver } = useDroppable({ id: `col:${status}`, data: { type: "column", status } });
   return (
@@ -195,6 +598,9 @@ function KanbanColumn({
               agents={agents}
               onStatusChange={onStatusChange}
               onDelete={onDelete}
+              onApprove={onApprove}
+              onReject={onReject}
+              onOpenDetail={onOpenDetail}
             />
           ))}
         </SortableContext>
@@ -291,6 +697,31 @@ export default function Tasks() {
     return acc;
   }, {} as Record<Status, Task[]>);
 
+  const [rejectTaskId, setRejectTaskId] = useState<number | null>(null);
+  const [rejectFeedback, setRejectFeedback] = useState("");
+  const [detailTaskId, setDetailTaskId] = useState<number | null>(null);
+
+  const approveTask = useMutation({
+    mutationFn: (id: number) => apiRequest("POST", `/api/tasks/${id}/approve`).then(r => r.json()),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/tenants", tid, "tasks"] });
+      toast({ title: "Task approved", description: "Task has been marked as done." });
+    },
+  });
+
+  const rejectTask = useMutation({
+    mutationFn: ({ id, feedback }: { id: number; feedback: string }) =>
+      apiRequest("POST", `/api/tasks/${id}/reject`, { feedback }).then(r => r.json()),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/tenants", tid, "tasks"] });
+      toast({ title: "Changes requested", description: "Agent will re-work the task with your feedback." });
+      setRejectTaskId(null);
+      setRejectFeedback("");
+    },
+  });
+
+  const reviewCount = useMemo(() => tasks.filter(t => t.status === "review").length, [tasks]);
+
   const [activeDragTaskId, setActiveDragTaskId] = useState<number | null>(null);
   const activeDragTask = useMemo(
     () => (activeDragTaskId ? tasks.find((t) => t.id === activeDragTaskId) ?? null : null),
@@ -320,6 +751,16 @@ export default function Tasks() {
           </Button>
         </div>
       </div>
+
+      {reviewCount > 0 && (
+        <div className="flex items-center gap-3 rounded-lg border border-yellow-400/30 bg-yellow-400/5 px-4 py-3">
+          <Eye className="w-4 h-4 text-yellow-400 flex-shrink-0" />
+          <div className="flex-1">
+            <p className="text-sm font-medium text-yellow-300">{reviewCount} task{reviewCount > 1 ? "s" : ""} awaiting your review</p>
+            <p className="text-xs text-muted-foreground">Review agent output and approve or request changes before marking as done.</p>
+          </div>
+        </div>
+      )}
 
       {view === "kanban" ? (
         <DndContext
@@ -356,6 +797,9 @@ export default function Tasks() {
                   agents={agents}
                   onStatusChange={(id, ns) => updateTask.mutate({ id, status: ns })}
                   onDelete={(id) => deleteTask.mutate(id)}
+                  onApprove={(id) => approveTask.mutate(id)}
+                  onReject={(id) => { setRejectTaskId(id); setRejectFeedback(""); }}
+                  onOpenDetail={(id) => setDetailTaskId(id)}
                 />
               );
             })}
@@ -393,7 +837,7 @@ export default function Tasks() {
                   const sc = STATUS_CONFIG[t.status as Status];
                   const Icon = sc.icon;
                   return (
-                    <tr key={t.id} className="border-b border-border last:border-0 hover:bg-muted/30 transition-colors" data-testid={`task-row-${t.id}`}>
+                    <tr key={t.id} className="border-b border-border last:border-0 hover:bg-muted/30 transition-colors cursor-pointer" data-testid={`task-row-${t.id}`} onClick={() => setDetailTaskId(t.id)}>
                       <td className="px-4 py-3">
                         <p className="font-medium text-foreground">{t.title}</p>
                         {t.description && <p className="text-xs text-muted-foreground truncate max-w-xs">{t.description}</p>}
@@ -412,9 +856,29 @@ export default function Tasks() {
                       <td className="px-4 py-3 text-xs text-muted-foreground">{agent?.displayName ?? "—"}</td>
                       <td className="px-4 py-3 text-xs text-muted-foreground">{t.goalTag ?? "—"}</td>
                       <td className="px-4 py-3">
-                        <button onClick={() => deleteTask.mutate(t.id)} className="text-muted-foreground hover:text-destructive transition-colors" data-testid={`delete-task-${t.id}`}>
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
+                        <div className="flex items-center gap-1.5">
+                          {t.status === "review" && (
+                            <>
+                              <button
+                                onClick={() => approveTask.mutate(t.id)}
+                                className="text-green-400 hover:text-green-300 transition-colors"
+                                title="Approve"
+                              >
+                                <ThumbsUp className="w-3.5 h-3.5" />
+                              </button>
+                              <button
+                                onClick={() => { setRejectTaskId(t.id); setRejectFeedback(""); }}
+                                className="text-orange-400 hover:text-orange-300 transition-colors"
+                                title="Request Changes"
+                              >
+                                <MessageSquareWarning className="w-3.5 h-3.5" />
+                              </button>
+                            </>
+                          )}
+                          <button onClick={() => deleteTask.mutate(t.id)} className="text-muted-foreground hover:text-destructive transition-colors" data-testid={`delete-task-${t.id}`}>
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   );
@@ -424,6 +888,55 @@ export default function Tasks() {
           </CardContent>
         </Card>
       )}
+
+      {/* Task detail modal */}
+      {detailTaskId !== null && (
+        <TaskDetailModal
+          taskId={detailTaskId}
+          tenantId={tid}
+          agents={agents}
+          open={true}
+          onClose={() => setDetailTaskId(null)}
+          onApprove={(id) => { approveTask.mutate(id); setDetailTaskId(null); }}
+          onReject={(id) => { setDetailTaskId(null); setRejectTaskId(id); setRejectFeedback(""); }}
+        />
+      )}
+
+      {/* Rejection feedback dialog */}
+      <Dialog open={rejectTaskId !== null} onOpenChange={(open) => { if (!open) { setRejectTaskId(null); setRejectFeedback(""); } }}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <MessageSquareWarning className="w-4 h-4 text-orange-400" />
+              Request Changes
+            </DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3">
+            <p className="text-sm text-muted-foreground">
+              Provide feedback so the agent knows what to improve. The task will be re-assigned and the agent will re-work it.
+            </p>
+            <TextareaBase
+              placeholder="What needs to change? Be specific..."
+              rows={4}
+              value={rejectFeedback}
+              onChange={(e) => setRejectFeedback(e.target.value)}
+              className="text-sm"
+            />
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => { setRejectTaskId(null); setRejectFeedback(""); }}>Cancel</Button>
+            <Button
+              variant="default"
+              className="bg-orange-500 hover:bg-orange-600 text-white"
+              disabled={rejectTask.isPending}
+              onClick={() => { if (rejectTaskId) rejectTask.mutate({ id: rejectTaskId, feedback: rejectFeedback }); }}
+            >
+              <Send className="w-3.5 h-3.5 mr-1" />
+              {rejectTask.isPending ? "Sending..." : "Send Feedback"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Create dialog */}
       <Dialog open={showCreate} onOpenChange={setShowCreate}>

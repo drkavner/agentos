@@ -59,7 +59,7 @@ function pickWorkTask(tenantId: number, agentId: number) {
   const assigned = db
     .select()
     .from(tasks)
-    .where(and(eq(tasks.tenantId, tenantId), eq(tasks.assignedAgentId, agentId), ne(tasks.status, "done")))
+    .where(and(eq(tasks.tenantId, tenantId), eq(tasks.assignedAgentId, agentId), ne(tasks.status, "done"), ne(tasks.status, "review")))
     .orderBy(tasks.id)
     .get();
   if (assigned) return assigned;
@@ -67,7 +67,7 @@ function pickWorkTask(tenantId: number, agentId: number) {
   const unassigned = db
     .select()
     .from(tasks)
-    .where(and(eq(tasks.tenantId, tenantId), isNull(tasks.assignedAgentId), ne(tasks.status, "done")))
+    .where(and(eq(tasks.tenantId, tenantId), isNull(tasks.assignedAgentId), ne(tasks.status, "done"), ne(tasks.status, "review")))
     .orderBy(tasks.id)
     .get();
   return unassigned;
@@ -238,6 +238,8 @@ export async function hermesRunOnce(
     forceChannelId?: string;
     forceChannelType?: "general" | "team" | "dm";
     bypassCooldown?: boolean;
+    /** If set, agent enters "discussion" mode — reacts to teammates' work instead of producing a deliverable. */
+    discussionContext?: string;
   },
 ) {
   const agent = storage.getAgent(agentId);
@@ -348,36 +350,71 @@ export async function hermesRunOnce(
 
     let assistantBody: string;
     if (canCallLlm) {
-      const userPrompt = task
-        ? [
-            `You have been assigned a task. PRODUCE THE ACTUAL DELIVERABLE — not a status update.`,
-            `Task: "${task.title}"`,
-            task.description ? `Description: ${String(task.description).slice(0, 2000)}` : null,
-            ``,
-            `INSTRUCTIONS:`,
-            `- If the task asks for code, WRITE THE COMPLETE WORKING CODE with file names.`,
-            `- If the task asks for a document, WRITE THE FULL DOCUMENT.`,
-            `- If the task asks for a plan, WRITE A DETAILED PLAN with concrete steps.`,
-            `- Use markdown formatting. Use code blocks with language tags for code.`,
-            `- DO NOT just say "I will do X" or "I'm starting work on X". Actually DO the work and show the output.`,
-            `- Be thorough and produce production-quality output.`,
-            lastMsg
-              ? `\nContext — latest channel message from ${lastMsg.senderName}: ${String(lastMsg.content).slice(0, 600)}`
-              : null,
-          ]
-            .filter(Boolean)
-            .join("\n")
-        : [
-            `Post a brief status update to channel "${primary.channelId}".`,
-            `Run trigger: ${reason}.`,
-            `No queued task — explain what you're monitoring and what you'd pick up next.`,
-            lastMsg
-              ? `Latest channel message from ${lastMsg.senderName}: ${String(lastMsg.content).slice(0, 600)}`
-              : "No prior messages in this channel.",
-            `Write 2–4 sentences, plain text, specific to your role and skills.`,
-          ]
-            .filter(Boolean)
-            .join("\n\n");
+      let userPrompt: string;
+      if (opts?.discussionContext) {
+        userPrompt = [
+          `You are in a TEAM DISCUSSION about a shared task. Your teammates have posted their work below.`,
+          `Your role: ${agent.role} (${agent.displayName})`,
+          task ? `Task: "${task.title}"` : null,
+          ``,
+          `=== TEAMMATES' WORK ===`,
+          opts.discussionContext,
+          `=== END TEAMMATES' WORK ===`,
+          ``,
+          `INSTRUCTIONS:`,
+          `- Read your teammates' deliverables above carefully.`,
+          `- Respond with specific, constructive feedback from YOUR expertise (${agent.role}).`,
+          `- Point out what's good, suggest improvements, flag risks or gaps you see.`,
+          `- If their work connects to yours, explain how and suggest integration points.`,
+          `- Reference specific parts of their work (quote or mention section names).`,
+          `- Keep it professional and collaborative. 3-6 sentences.`,
+          `- DO NOT repeat their work. DO NOT produce a new deliverable. Just discuss.`,
+        ].filter(Boolean).join("\n");
+      } else if (task) {
+        const descText = String(task.description ?? "");
+        const feedbackMatch = descText.match(/--- Reviewer Feedback ---\n([\s\S]+)$/);
+        const reviewerFeedback = feedbackMatch ? feedbackMatch[1]!.trim() : null;
+        const isRevision = !!reviewerFeedback;
+
+        userPrompt = [
+          isRevision
+            ? `Your previous work on this task was reviewed and CHANGES WERE REQUESTED. Address the feedback below and produce an improved deliverable.`
+            : `You have been assigned a task. PRODUCE THE ACTUAL DELIVERABLE — not a status update.`,
+          `Task: "${task.title}"`,
+          task.description ? `Description: ${descText.slice(0, 2000)}` : null,
+          isRevision ? `\n⚠️ REVIEWER FEEDBACK (address this):\n${reviewerFeedback}` : null,
+          ``,
+          `INSTRUCTIONS:`,
+          `- If the task asks for code, WRITE THE COMPLETE WORKING CODE with file names.`,
+          `- If the task asks for a document, WRITE THE FULL DOCUMENT.`,
+          `- If the task asks for a plan, WRITE A DETAILED PLAN with concrete steps.`,
+          `- Use markdown formatting. Use code blocks with language tags for code.`,
+          `- DO NOT just say "I will do X" or "I'm starting work on X". Actually DO the work and show the output.`,
+          `- Be thorough and produce production-quality output.`,
+          isRevision
+            ? `- Pay special attention to the reviewer feedback above. Show what you changed.`
+            : null,
+          lastMsg
+            ? `\nContext — latest channel message from ${lastMsg.senderName}: ${String(lastMsg.content).slice(0, 600)}`
+            : null,
+        ].filter(Boolean).join("\n");
+      } else {
+        userPrompt = [
+          `Post a status update to channel "${primary.channelId}".`,
+          lastMsg
+            ? `The latest message in the channel is from ${lastMsg.senderName}: "${String(lastMsg.content).slice(0, 600)}"`
+            : null,
+          ``,
+          `INSTRUCTIONS:`,
+          `- Write as ${agent.displayName} speaking naturally to the team.`,
+          `- Lead with CONCRETE UPDATES: metrics, progress, blockers, or results.`,
+          `- If someone addressed you or your area, respond to them directly using @Name.`,
+          `- If you're a leader, give direction to your reports or ask for updates.`,
+          `- If you're an IC, report on your current work or flag issues to your manager.`,
+          `- DO NOT start with "Status Update:" or "Checking in:" — just speak naturally.`,
+          `- 1-3 sentences. Be direct. No fluff.`,
+        ].filter(Boolean).join("\n");
+      }
 
       const defaultTimeout = task ? 300_000 : 120_000;
       const timeoutMs = runtime.timeoutSec > 0 ? Math.min(600_000, runtime.timeoutSec * 1000) : defaultTimeout;
@@ -566,15 +603,15 @@ export async function hermesRunOnce(
           message: `CEO task #${task.id} kept open while delegated child tasks are still incomplete`,
         });
       } else {
-        storage.updateTask(task.id, { status: "done", actualTokens: tokensUsed } as any);
-        addRunEvent(run.id, { kind: "event", message: `completed task #${task.id}` });
+        storage.updateTask(task.id, { status: "review", actualTokens: tokensUsed } as any);
+        addRunEvent(run.id, { kind: "event", message: `task #${task.id} ready for review` });
         auditAndInvalidate(tenantId, ["tasks", "goals"], {
           agentId,
           agentName: agent.displayName,
-          action: "task_completed",
+          action: "task_status_changed",
           entity: "task",
           entityId: String(task.id),
-          detail: task.title,
+          detail: `${task.title} → awaiting review`,
           tokensUsed,
           cost: costUsd,
         });

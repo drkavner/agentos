@@ -79,10 +79,9 @@ app.use((req, res, next) => {
   // Agent Library catalog must exist even when full demo seed is disabled (e.g. production).
   ensureAgentDefinitionsCatalog();
 
-  // Demo seed is disabled by default. Opt-in only.
+  // Demo seed: opt-in with SEED=true. Without it, data persists across restarts.
   const shouldSeed = process.env.SEED === "true";
   if (shouldSeed) seedDatabase();
-  else removeDemoTenantIfPresent();
 
   await registerRoutes(httpServer, app);
   repairAllTenantsMissingCeo();

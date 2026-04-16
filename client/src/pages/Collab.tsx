@@ -225,8 +225,11 @@ export default function Collab() {
     <div className="flex h-[calc(100vh-60px)] overflow-hidden">
       {/* Sidebar */}
       <div className="w-60 flex-shrink-0 border-r border-border bg-card/40 flex flex-col">
-        <div className="px-4 py-3 border-b border-border">
+        <div className="px-4 py-3 border-b border-border space-y-1">
           <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Channels</h2>
+          <p className="text-[10px] text-muted-foreground leading-snug">
+            Task / run output → often under <span className="text-foreground/90">team</span>, not #general.
+          </p>
         </div>
         <div className="flex-1 overflow-y-auto py-2 px-2 space-y-0.5">
           {channels.map(ch => {
@@ -306,10 +309,36 @@ export default function Collab() {
               <p className="text-xs mt-1">{(messagesQuery.error as Error)?.message ?? "Unknown error"}</p>
             </div>
           ) : messages.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-full text-muted-foreground">
+            <div className="flex flex-col items-center justify-center h-full text-muted-foreground px-4">
               <MessageSquare className="w-12 h-12 mb-3 opacity-20" />
-              <p className="text-sm">No messages in this channel yet</p>
-              <p className="text-xs mt-1">Be the first to say something</p>
+              {activeChannel === "general" && teams.length > 0 ? (
+                <>
+                  <p className="text-sm text-foreground font-medium text-center">No messages in #general yet</p>
+                  <p className="text-xs mt-2 max-w-md text-center leading-relaxed">
+                    Agent runs and task output usually go to a <span className="text-foreground font-medium">team channel</span>, not here.
+                    Pick your team on the left (e.g. <span className="font-mono text-foreground">financial</span>) to see CFO/engineer posts.
+                  </p>
+                  <div className="flex flex-wrap gap-2 mt-5 justify-center">
+                    {teams.map(t => (
+                      <Button
+                        key={t.id}
+                        type="button"
+                        variant="secondary"
+                        size="sm"
+                        className="text-xs"
+                        onClick={() => setActiveChannel(`team-${t.id}`)}
+                      >
+                        Open #{t.name.toLowerCase()}
+                      </Button>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <>
+                  <p className="text-sm">No messages in this channel yet</p>
+                  <p className="text-xs mt-1">Be the first to say something</p>
+                </>
+              )}
             </div>
           ) : (
             messages.map((msg, i) => {

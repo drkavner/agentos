@@ -77,14 +77,41 @@ type CliRunOpts = {
 function buildPrompt(
   agent: { displayName: string; role: string; goal?: string | null },
   task: { id: number; title: string; description?: string | null } | null,
+  discussionContext?: string,
 ): string {
+  if (discussionContext) {
+    return [
+      `You are ${agent.displayName} (${agent.role}).`,
+      `You are in a TEAM DISCUSSION. Your teammates have posted their work below.`,
+      task ? `Task: "${task.title}"` : "",
+      "",
+      `=== TEAMMATES' WORK ===`,
+      discussionContext,
+      `=== END TEAMMATES' WORK ===`,
+      "",
+      `Respond with specific feedback from YOUR expertise (${agent.role}).`,
+      `Point out what's good, suggest improvements, flag risks or gaps.`,
+      `Reference specific parts of their work. 3-6 sentences. Be collaborative.`,
+      `DO NOT repeat their work or produce a new deliverable.`,
+    ].filter(Boolean).join("\n");
+  }
+
   const parts: string[] = [];
   parts.push(`You are ${agent.displayName} (${agent.role}).`);
   if (agent.goal) parts.push(`Goal: ${agent.goal}`);
   if (task) {
+    const descText = String(task.description ?? "");
+    const feedbackMatch = descText.match(/--- Reviewer Feedback ---\n([\s\S]+)$/);
+    const reviewerFeedback = feedbackMatch ? feedbackMatch[1]!.trim() : null;
+
     parts.push(`\nTask #${task.id}: ${task.title}`);
-    if (task.description) parts.push(`Description: ${String(task.description).slice(0, 1000)}`);
-    parts.push(`\nComplete this task and provide a detailed response with your work output.`);
+    if (task.description) parts.push(`Description: ${descText.slice(0, 1000)}`);
+    if (reviewerFeedback) {
+      parts.push(`\n⚠️ REVIEWER FEEDBACK (address this):\n${reviewerFeedback}`);
+      parts.push(`\nYour previous work was reviewed and changes were requested. Improve your output based on the feedback above.`);
+    } else {
+      parts.push(`\nComplete this task and provide a detailed response with your work output.`);
+    }
   } else {
     parts.push(`\nNo pending tasks. Report your current status, any observations, and what you plan to work on next.`);
   }
@@ -175,7 +202,13 @@ async function llmFallback(
 export async function cliRunOnce(
   tenantId: number,
   agentId: number,
-  opts?: { reason?: string; bypassCooldown?: boolean },
+  opts?: {
+    reason?: string;
+    bypassCooldown?: boolean;
+    forceChannelId?: string;
+    forceChannelType?: "general" | "team" | "dm";
+    discussionContext?: string;
+  },
 ) {
   const reason = opts?.reason ?? "manual";
   const agent = storage.getAgent(agentId);
@@ -194,10 +227,10 @@ export async function cliRunOnce(
 
   const allTasks = storage.getTasks(tenantId);
   const task = allTasks.find(
-    (t) => t.assignedAgentId === agentId && t.status !== "done",
+    (t) => t.assignedAgentId === agentId && t.status !== "done" && t.status !== "review",
   ) ?? null;
 
-  const userPrompt = buildPrompt(agent, task);
+  const userPrompt = buildPrompt(agent, task, opts?.discussionContext);
   const modelId = runtime.model || agent.model || "";
   const timeoutSec = runtime.timeoutSec > 0 ? runtime.timeoutSec : 120;
   const routing = runtime.llmProvider;
@@ -337,10 +370,13 @@ export async function cliRunOnce(
     } catch { /* best-effort */ }
   }
 
+  const postChannelId = opts?.forceChannelId ?? "general";
+  const postChannelType = opts?.forceChannelType ?? "general";
+
   const posted = storage.createMessage({
     tenantId,
-    channelId: "general",
-    channelType: "general",
+    channelId: postChannelId,
+    channelType: postChannelType,
     senderAgentId: agentId,
     senderName: `${agent.displayName} (${agent.role})`,
     senderEmoji: def.emoji ?? "🤖",
@@ -372,14 +408,14 @@ export async function cliRunOnce(
   });
 
   if (task && exitCode === 0 && !timedOut) {
-    storage.updateTask(task.id, { status: "done" } as any);
+    storage.updateTask(task.id, { status: "review" } as any);
     auditAndInvalidate(tenantId, ["tasks", "goals"], {
       agentId,
       agentName: agent.displayName,
-      action: "task_completed",
+      action: "task_status_changed",
       entity: "task",
       entityId: String(task.id),
-      detail: task.title,
+      detail: `${task.title} → awaiting review`,
       tokensUsed,
       cost: costUsd,
     });

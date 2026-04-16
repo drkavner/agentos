@@ -23,13 +23,40 @@ export type OpenclawRunOk = {
 export async function openclawRunOnce(
   tenantId: number,
   agentId: number,
-  _opts?: { reason?: "manual" | "scheduled" },
+  _opts?: {
+    reason?: "manual" | "scheduled" | string;
+    bypassCooldown?: boolean;
+    forceChannelId?: string;
+    forceChannelType?: "general" | "team" | "dm";
+    discussionContext?: string;
+  },
 ): Promise<OpenclawRunOk | { ok: false; error: string }> {
   const agent = storage.getAgent(agentId);
   if (!agent || agent.tenantId !== tenantId) return { ok: false, error: "agent_not_found" };
   const tenant = storage.getTenant(tenantId);
   if (!tenant) return { ok: false, error: "tenant_not_found" };
   // Per-agent adapter override: allow openclaw runs regardless of tenant default
+
+  // If discussion mode is requested, route through Hermes LLM since OpenClaw
+  // gateway doesn't support interactive discussion natively.
+  if (_opts?.discussionContext) {
+    const { hermesRunOnce } = await import("./hermesAdapter");
+    const r = await hermesRunOnce(tenantId, agentId, {
+      reason: (_opts.reason ?? "manual") as any,
+      bypassCooldown: _opts.bypassCooldown,
+      forceChannelId: _opts.forceChannelId,
+      forceChannelType: _opts.forceChannelType,
+      discussionContext: _opts.discussionContext,
+    });
+    return {
+      ok: true as const,
+      tokensUsed: (r as any).tokensUsed ?? 0,
+      costUsd: (r as any).costUsd ?? 0,
+      llmMode: "gateway" as const,
+      completedTaskId: null,
+      skillsSource: "openclaw" as const,
+    };
+  }
 
   const run = createAgentRun({ tenantId, agentId, trigger: "on_demand" });
   addRunEvent(run.id, {
@@ -39,7 +66,8 @@ export async function openclawRunOnce(
   });
 
   const def = storage.getAgentDefinition(agent.definitionId);
-  const primary = pickAgentPrimaryChannel(tenantId, agentId, null);
+  const channelId = _opts?.forceChannelId ?? pickAgentPrimaryChannel(tenantId, agentId, null).channelId;
+  const channelType = _opts?.forceChannelType ?? (channelId.startsWith("team-") ? "team" : channelId.startsWith("dm-") ? "dm" : "general");
   const body = [
     `[OpenClaw] Manual run from Cortex — prompts/skills for this agent are loaded here.`,
     `Hook your OpenClaw gateway to automate real work; this message confirms the run signal was saved (run #${run.id}).`,
@@ -47,8 +75,8 @@ export async function openclawRunOnce(
 
   const posted = storage.createMessage({
     tenantId,
-    channelId: primary.channelId,
-    channelType: primary.channelType,
+    channelId,
+    channelType,
     senderAgentId: agentId,
     senderName: `${agent.displayName} (${agent.role})`,
     senderEmoji: def?.emoji ?? "🤖",
@@ -57,7 +85,7 @@ export async function openclawRunOnce(
     metadata: { openclawRun: true, runId: run.id },
   } as any);
 
-  addRunEvent(run.id, { kind: "stdout", message: `Posted collaboration message #${posted.id} → ${primary.channelId}` });
+  addRunEvent(run.id, { kind: "stdout", message: `Posted collaboration message #${posted.id} → ${channelId}` });
 
   auditAndInvalidate(tenantId, ["messages"], {
     agentId,

@@ -18,15 +18,46 @@ export async function buildAgentSystemPrompt(tenantId: number, agentId: number):
   ensureAgentConfigurationTables();
   const runtime = getAgentRuntimeSettings(agentId);
 
+  // Build org hierarchy context
+  const allAgents = storage.getAgents(tenantId);
+  const manager = agent.managerId ? allAgents.find(a => a.id === agent.managerId) : null;
+  const directReports = allAgents.filter(a => a.managerId === agent.id);
+  const isLeader = directReports.length > 0;
+  const isCeo = !agent.managerId && String(agent.role).toLowerCase().includes("ceo");
+
   const sections: string[] = [];
+
+  const hierarchyLines: string[] = [];
+  if (isCeo) {
+    hierarchyLines.push(`You are the CEO. You lead this entire organization.`);
+    hierarchyLines.push(`Your direct reports: ${directReports.map(r => `${r.displayName} (${r.role})`).join(", ")}.`);
+    hierarchyLines.push(`You set direction, make decisions, delegate tasks, and hold your team accountable.`);
+  } else if (isLeader) {
+    hierarchyLines.push(`You report to: ${manager ? `${manager.displayName} (${manager.role})` : "—"}.`);
+    hierarchyLines.push(`Your direct reports: ${directReports.map(r => `${r.displayName} (${r.role})`).join(", ")}.`);
+    hierarchyLines.push(`You lead your team, delegate work to your reports, and report progress upward.`);
+  } else {
+    hierarchyLines.push(`You report to: ${manager ? `${manager.displayName} (${manager.role})` : "—"}.`);
+    hierarchyLines.push(`You are an individual contributor. Execute tasks assigned to you and report back.`);
+  }
+
+  const peers = manager ? allAgents.filter(a => a.managerId === agent.managerId && a.id !== agent.id) : [];
 
   sections.push(`You are ${agent.displayName} (${agent.role}) inside org "${tenant.name}".
 
 Mission: ${tenant.mission ?? "—"}
 Goal: ${agent.goal ?? "—"}
 
-Adapter: ${tenant.adapterType}
-LLM routing: ${runtime.llmProvider === "ollama" ? "Ollama (local)" : "OpenRouter"}`);
+${hierarchyLines.join("\n")}
+${peers.length > 0 ? `Peers: ${peers.map(p => `${p.displayName} (${p.role})`).join(", ")}.` : ""}
+
+COMMUNICATION STYLE:
+- Be direct and professional. Use your name and role naturally.
+- Reference teammates by name when coordinating.
+- When giving orders (if you're a leader), be clear and specific.
+- When reporting status, lead with concrete metrics or blockers.
+- Keep messages concise: 1-3 sentences for updates, more for deliverables.
+- Use @Name to address someone directly.`);
 
   if (docs) {
     sections.push(docs.SOUL.markdown);
