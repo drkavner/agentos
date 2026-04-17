@@ -11,6 +11,7 @@ import MyAgents from "./pages/MyAgents";
 import OrgChart from "./pages/OrgChart";
 import Tasks from "./pages/Tasks";
 import Collab from "./pages/Collab";
+import Teams from "./pages/Teams";
 import Settings from "./pages/Settings";
 import Tenants from "./pages/Tenants";
 import AuditLog from "./pages/AuditLog";
@@ -35,6 +36,7 @@ export default function App() {
               <Route path="/org" component={OrgChart} />
               <Route path="/tasks" component={Tasks} />
               <Route path="/collab" component={Collab} />
+              <Route path="/teams" component={Teams} />
               <Route path="/audit" component={AuditLog} />
               <Route path="/tenants" component={Tenants} />
               <Route path="/settings" component={Settings} />

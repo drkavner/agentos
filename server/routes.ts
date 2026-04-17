@@ -4,6 +4,8 @@ import { storage } from "./storage";
 import { ApiError } from "./apiError";
 import fs from "fs";
 import path from "path";
+import archiver from "archiver";
+import { Writable } from "stream";
 import { db } from "./db";
 import { sql } from "drizzle-orm";
 import { setupTenantSseRoute } from "./tenantEvents";
@@ -1250,6 +1252,445 @@ export async function registerRoutes(httpServer: Server, app: Express) {
     res.json({ ok: true });
   });
 
+  // ─── Team Instruction Files (markdown) ────────────────────────────────────
+  // Stored on disk (no DB migration): `team-instructions/tenant-{tid}/team-{teamId}/*.md`
+  function teamInstructionsRoot(tenantId: number, teamId: number) {
+    return path.resolve("team-instructions", `tenant-${tenantId}`, `team-${teamId}`);
+  }
+
+  function safeSlug(raw: string) {
+    return String(raw || "")
+      .trim()
+      .replace(/[^a-zA-Z0-9_-]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .slice(0, 60) || "item";
+  }
+
+  type TeamLock = { locked: boolean; owner?: string; lockedAt?: string };
+  function teamLockPath(tenantId: number, teamId: number) {
+    return safeJoin(teamInstructionsRoot(tenantId, teamId), ".lock.json");
+  }
+  function readTeamLock(tenantId: number, teamId: number): TeamLock {
+    try {
+      const p = teamLockPath(tenantId, teamId);
+      if (!fs.existsSync(p)) return { locked: false };
+      const raw = readFileUtf8(p);
+      const obj = JSON.parse(raw || "{}") as TeamLock;
+      if (!obj || !obj.locked) return { locked: false };
+      return { locked: true, owner: obj.owner, lockedAt: obj.lockedAt };
+    } catch {
+      return { locked: false };
+    }
+  }
+  function writeTeamLock(tenantId: number, teamId: number, lock: TeamLock) {
+    const root = teamInstructionsRoot(tenantId, teamId);
+    ensureDir(root);
+    writeFileUtf8(teamLockPath(tenantId, teamId), JSON.stringify(lock, null, 2));
+  }
+
+  app.get("/api/tenants/:tenantId/teams/:teamId/files", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const teamId = Number(req.params.teamId);
+    const tenant = storage.getTenant(tenantId);
+    const team = storage.getTeam(teamId);
+    if (!tenant) throw new ApiError(404, "not_found", "Tenant not found");
+    if (!team || team.tenantId !== tenantId) throw new ApiError(404, "not_found", "Team not found");
+
+    const rootPath = teamInstructionsRoot(tenantId, teamId);
+    ensureDir(rootPath);
+
+    const buildDefaults = (t: { name: string; description?: string | null }) => {
+      const name = String(t.name || "Team");
+      const desc = String(t.description || "").trim();
+      const key = `${name} ${desc}`.toLowerCase();
+
+      const sharedHeader = `# Team: ${name}\n\n${desc ? `> ${desc}\n\n` : ""}`;
+
+      const teamBase = (focusBullets: string[], interfacesBullets: string[], cadenceBullets: string[], artifactsBullets: string[]) =>
+        `${sharedHeader}## Focus\n${focusBullets.map((b) => `- ${b}`).join("\n")}\n\n## Interfaces\n${interfacesBullets.map((b) => `- ${b}`).join("\n")}\n\n## Cadence\n${cadenceBullets.map((b) => `- ${b}`).join("\n")}\n\n## Artifacts\n${artifactsBullets.map((b) => `- ${b}`).join("\n")}\n\n## Operating principles\n- Keep updates concise\n- Escalate blockers early\n- Prefer measurable outputs\n- Document decisions\n`;
+
+      if (key.includes("financ") || key.includes("fp&a") || key.includes("treasury") || key.includes("account")) {
+        return {
+          "TEAM.md": teamBase(
+            ["Forecasting, runway, and board-ready financial reporting", "Covenants, cash, and spend visibility"],
+            ["CEO / leadership for decisions", "Engineering for cost drivers + product metrics", "Vendors/banks for treasury ops"],
+            ["Weekly: forecast refresh + risks", "Monthly: close + board pack draft", "Ad-hoc: scenario modeling"],
+            ["Forecast model + assumptions table", "Runway memo", "Board-ready KPI dashboard", "Risk register (finance)"],
+          ),
+          "INSTRUCTIONS.md": `# Instructions — Finance\n\n## Primary outcomes\n- Accurate forecast (weekly / monthly)\n- Runway + burn clarity\n- Board-ready reporting\n- Risk & compliance hygiene\n\n## How to execute tasks\n- Start with assumptions and inputs\n- Show calculations and checks\n- Provide a clear narrative summary\n- Include a table for numbers whenever possible\n\n## What to report back in Collaboration\n- Current state + key numbers\n- Decisions needed (with options)\n- Risks / blockers and mitigation\n- Next steps + owner\n`,
+        };
+      }
+
+      if (key.includes("engineer") || key.includes("product") || key.includes("build") || key.includes("platform")) {
+        return {
+          "TEAM.md": teamBase(
+            ["Ship product features safely and quickly", "Keep APIs stable and the system reliable"],
+            ["CEO / leadership for priorities", "Finance for metrics + constraints", "Support for customer feedback"],
+            ["Daily: short async updates in team channel", "Weekly: planning + review", "On-demand: incident response"],
+            ["PRDs / acceptance criteria (as markdown)", "Release notes", "Runbooks", "Architecture notes"],
+          ),
+          "INSTRUCTIONS.md": `# Instructions — Engineering\n\n## Primary outcomes\n- Ship working features safely\n- Maintain reliability + performance\n- Keep APIs and data consistent\n\n## How to execute tasks\n- Clarify acceptance criteria\n- Implement smallest working slice\n- Add tests where practical\n- Provide runnable steps and file outputs\n\n## What to report back in Collaboration\n- What shipped (with links/files)\n- What’s blocked and why\n- Risks / edge cases\n- Follow-ups and ownership\n`,
+        };
+      }
+
+      if (key.includes("health") || key.includes("wellness") || key.includes("people") || key.includes("hr")) {
+        return {
+          "TEAM.md": teamBase(
+            ["Employee wellness programs and measurable outcomes", "Safe, evidence-based guidance (non-medical)"],
+            ["CEO / leadership for sponsorship", "Legal/Compliance for privacy + safety constraints", "All teams as stakeholders"],
+            ["Weekly: program update + participation metrics", "Monthly: survey insights + experiments", "Quarterly: program review"],
+            ["Wellness program playbook", "Survey instruments + analysis plan", "KPI dashboard spec", "Safety/privacy checklist"],
+          ),
+          "INSTRUCTIONS.md": `# Instructions — Health & Wellness\n\n## Primary outcomes\n- Increase participation in wellness programs\n- Improve self-reported wellbeing (survey)\n- Provide safe, evidence-based guidance\n- Respect privacy and compliance constraints\n\n## How to execute tasks\n- Prefer evidence-based recommendations\n- Avoid medical diagnosis; add safety disclaimers when needed\n- Make programs measurable (baseline → goal → tracking)\n- Keep materials concise and reusable (markdown playbooks)\n\n## What to report back in Collaboration\n- Program plan + key deliverables\n- Participation metrics + survey insights\n- Risks (privacy/safety) + mitigations\n- Next experiments + timeline\n`,
+        };
+      }
+
+      return {
+        "TEAM.md": teamBase(
+          ["Define what this team owns", "Define what success means and how it’s measured"],
+          ["Other teams that depend on us", "Teams we depend on"],
+          ["Weekly: plan + review", "Monthly: metrics check-in"],
+          ["Playbook (how we work)", "Metrics + dashboards", "Decision log"],
+        ),
+        "INSTRUCTIONS.md": `# Instructions\n\n## Primary outcomes\n- Define what this team owns\n- Define success metrics\n\n## How to execute tasks\n- Keep scope tight\n- Produce concrete outputs\n- Validate assumptions\n\n## What to report back in Collaboration\n- Progress + blockers\n- Deliverables + next steps\n`,
+      };
+    };
+
+    const defaults: Record<string, string> = buildDefaults(team);
+
+    // Backfill defaults if folder is empty, or if files still match the old generic defaults.
+    const existing = listMarkdownFiles(rootPath);
+    if (existing.length === 0) {
+      for (const [filename, markdown] of Object.entries(defaults)) {
+        writeFileUtf8(safeJoin(rootPath, filename), markdown);
+      }
+      auditAndInvalidate(tenantId, ["teams"], {
+        action: "team_files_created",
+        entity: "team",
+        entityId: String(teamId),
+        detail: `Created default instruction files for team "${team.name}"`,
+        tokensUsed: 0,
+        cost: 0,
+      });
+    } else {
+      const oldGenericTeam = `# Team: ${team.name}\n\n## Focus\nDescribe what this team owns and what “good” looks like.\n\n## Operating principles\n- Keep updates concise\n- Escalate blockers early\n- Prefer measurable outputs\n`;
+      const oldGenericInstructions = `# Instructions\n\n- Primary outcomes this team is responsible for\n- How tasks should be executed\n- What to report back in Collaboration\n`;
+
+      try {
+        const teamPath = safeJoin(rootPath, "TEAM.md");
+        const instPath = safeJoin(rootPath, "INSTRUCTIONS.md");
+        if (fs.existsSync(teamPath)) {
+          const cur = readFileUtf8(teamPath);
+          const isOldTeam =
+            cur.trim() === oldGenericTeam.trim() ||
+            // upgrade earlier "baseTeam" variant that was identical across teams
+            (!cur.includes("## Interfaces") && cur.includes("## Focus") && cur.includes("## Operating principles"));
+          if (isOldTeam) writeFileUtf8(teamPath, defaults["TEAM.md"]!);
+        }
+        if (fs.existsSync(instPath)) {
+          const cur = readFileUtf8(instPath);
+          if (cur.trim() === oldGenericInstructions.trim()) writeFileUtf8(instPath, defaults["INSTRUCTIONS.md"]!);
+        }
+      } catch {
+        // best-effort
+      }
+    }
+
+    const now = new Date().toISOString();
+    const names = listMarkdownFiles(rootPath);
+    const out = names
+      .slice()
+      .sort((a, b) => a.localeCompare(b))
+      .map((filename) => ({
+        id: 0,
+        tenantId,
+        teamId,
+        filename,
+        markdown: readFileUtf8(safeJoin(rootPath, filename)),
+        updatedAt: now,
+      }));
+    res.json(out);
+  });
+
+  // Team lock (prevents other users from editing team files)
+  app.get("/api/tenants/:tenantId/teams/:teamId/lock", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const teamId = Number(req.params.teamId);
+    const tenant = storage.getTenant(tenantId);
+    const team = storage.getTeam(teamId);
+    if (!tenant) throw new ApiError(404, "not_found", "Tenant not found");
+    if (!team || team.tenantId !== tenantId) throw new ApiError(404, "not_found", "Team not found");
+    ensureDir(teamInstructionsRoot(tenantId, teamId));
+    res.json(readTeamLock(tenantId, teamId));
+  });
+
+  app.post("/api/tenants/:tenantId/teams/:teamId/lock", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const teamId = Number(req.params.teamId);
+    const tenant = storage.getTenant(tenantId);
+    const team = storage.getTeam(teamId);
+    if (!tenant) throw new ApiError(404, "not_found", "Tenant not found");
+    if (!team || team.tenantId !== tenantId) throw new ApiError(404, "not_found", "Team not found");
+    const owner = String(req.body?.owner || "").trim() || "unknown";
+    const cur = readTeamLock(tenantId, teamId);
+    if (cur.locked && cur.owner && cur.owner !== owner) throw new ApiError(423, "locked", `Team is locked by ${cur.owner}`);
+    const next: TeamLock = { locked: true, owner, lockedAt: new Date().toISOString() };
+    writeTeamLock(tenantId, teamId, next);
+    auditAndInvalidate(tenantId, ["teams"], {
+      action: "team_locked",
+      entity: "team",
+      entityId: String(teamId),
+      detail: `Team "${team.name}" locked by ${owner}`,
+      tokensUsed: 0,
+      cost: 0,
+    });
+    res.json(next);
+  });
+
+  app.delete("/api/tenants/:tenantId/teams/:teamId/lock", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const teamId = Number(req.params.teamId);
+    const tenant = storage.getTenant(tenantId);
+    const team = storage.getTeam(teamId);
+    if (!tenant) throw new ApiError(404, "not_found", "Tenant not found");
+    if (!team || team.tenantId !== tenantId) throw new ApiError(404, "not_found", "Team not found");
+    const owner = String(req.body?.owner || "").trim() || "unknown";
+    const cur = readTeamLock(tenantId, teamId);
+    if (cur.locked && cur.owner && cur.owner !== owner) throw new ApiError(423, "locked", `Team is locked by ${cur.owner}`);
+    const next: TeamLock = { locked: false };
+    writeTeamLock(tenantId, teamId, next);
+    auditAndInvalidate(tenantId, ["teams"], {
+      action: "team_unlocked",
+      entity: "team",
+      entityId: String(teamId),
+      detail: `Team "${team.name}" unlocked by ${owner}`,
+      tokensUsed: 0,
+      cost: 0,
+    });
+    res.json(next);
+  });
+
+  // Publish team docs to Collaboration (as deliverable-style messages in team channel)
+  app.post("/api/tenants/:tenantId/teams/:teamId/publish", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const teamId = Number(req.params.teamId);
+    const tenant = storage.getTenant(tenantId);
+    const team = storage.getTeam(teamId);
+    if (!tenant) throw new ApiError(404, "not_found", "Tenant not found");
+    if (!team || team.tenantId !== tenantId) throw new ApiError(404, "not_found", "Team not found");
+
+    const rootPath = teamInstructionsRoot(tenantId, teamId);
+    ensureDir(rootPath);
+    const names = listMarkdownFiles(rootPath);
+    const teamSlug = safeSlug(team.name);
+    const blocks = names
+      .slice()
+      .sort((a, b) => a.localeCompare(b))
+      .map((fn) => {
+        const md = readFileUtf8(safeJoin(rootPath, fn));
+        return `## File: team-docs/${teamSlug}/${fn}\n\`\`\`md\n${md}\n\`\`\``;
+      })
+      .join("\n\n");
+
+    const content =
+      `Team docs published for **${team.name}**.\n\n` +
+      `Download full team export (.zip): /api/tenants/${tenantId}/teams/${teamId}/export\n\n` +
+      blocks;
+
+    const msg = storage.createMessage({
+      tenantId,
+      channelId: `team-${teamId}`,
+      channelType: "team",
+      senderAgentId: null,
+      senderName: "System",
+      senderEmoji: "📦",
+      content,
+      messageType: "system",
+      metadata: JSON.stringify({ teamId, publishedDocs: true }),
+    } as any);
+
+    auditAndInvalidate(tenantId, ["messages"], {
+      action: "team_docs_published",
+      entity: "team",
+      entityId: String(teamId),
+      detail: `Published docs for team "${team.name}" to Collaboration`,
+      tokensUsed: 0,
+      cost: 0,
+    });
+
+    res.json({ ok: true, messageId: msg.id });
+  });
+
+  app.put("/api/tenants/:tenantId/teams/:teamId/files/:filename", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const teamId = Number(req.params.teamId);
+    const filename = String(req.params.filename || "");
+    const tenant = storage.getTenant(tenantId);
+    const team = storage.getTeam(teamId);
+    if (!tenant) throw new ApiError(404, "not_found", "Tenant not found");
+    if (!team || team.tenantId !== tenantId) throw new ApiError(404, "not_found", "Team not found");
+
+    const owner = String(req.body?.owner || "").trim() || "unknown";
+    const lock = readTeamLock(tenantId, teamId);
+    if (lock.locked && lock.owner && lock.owner !== owner) {
+      throw new ApiError(423, "locked", `Team is locked by ${lock.owner}`);
+    }
+
+    const markdown = String(req.body?.markdown ?? "");
+    if (!filename || filename.length > 120) throw new ApiError(400, "validation_error", "Invalid filename");
+    if (!filename.toLowerCase().endsWith(".md")) throw new ApiError(400, "validation_error", "Filename must end with .md");
+    if (markdown.length > 20000) throw new ApiError(400, "validation_error", "Markdown too large");
+
+    const rootPath = teamInstructionsRoot(tenantId, teamId);
+    ensureDir(rootPath);
+    writeFileUtf8(safeJoin(rootPath, filename), markdown);
+
+    auditAndInvalidate(tenantId, ["teams"], {
+      action: "team_file_saved",
+      entity: "team",
+      entityId: String(teamId),
+      detail: `Saved ${filename} for team "${team.name}"`,
+      tokensUsed: 0,
+      cost: 0,
+    });
+
+    res.json({ ok: true, tenantId, teamId, filename, markdown, updatedAt: new Date().toISOString() });
+  });
+
+  app.delete("/api/tenants/:tenantId/teams/:teamId/files/:filename", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const teamId = Number(req.params.teamId);
+    const filename = String(req.params.filename || "");
+    const tenant = storage.getTenant(tenantId);
+    const team = storage.getTeam(teamId);
+    if (!tenant) throw new ApiError(404, "not_found", "Tenant not found");
+    if (!team || team.tenantId !== tenantId) throw new ApiError(404, "not_found", "Team not found");
+    if (!filename || !filename.toLowerCase().endsWith(".md")) throw new ApiError(400, "validation_error", "Invalid filename");
+
+    const owner = String(req.body?.owner || "").trim() || "unknown";
+    const lock = readTeamLock(tenantId, teamId);
+    if (lock.locked && lock.owner && lock.owner !== owner) {
+      throw new ApiError(423, "locked", `Team is locked by ${lock.owner}`);
+    }
+
+    const rootPath = teamInstructionsRoot(tenantId, teamId);
+    try {
+      deleteFileIfExists(safeJoin(rootPath, filename));
+    } catch {
+      // ignore
+    }
+    auditAndInvalidate(tenantId, ["teams"], {
+      action: "team_file_deleted",
+      entity: "team",
+      entityId: String(teamId),
+      detail: `Deleted ${filename} for team "${team.name}"`,
+      tokensUsed: 0,
+      cost: 0,
+    });
+    res.json({ ok: true });
+  });
+
+  // Agent docs bundle for a deployed agent (SOUL/AGENT/HEARTBEAT/TOOLS + effective SKILLS)
+  app.get("/api/tenants/:tenantId/agents/:agentId/docs", async (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const agentId = Number(req.params.agentId);
+    const tenant = storage.getTenant(tenantId);
+    const agent = storage.getAgent(agentId);
+    if (!tenant) throw new ApiError(404, "not_found", "Tenant not found");
+    if (!agent || agent.tenantId !== tenantId) throw new ApiError(404, "not_found", "Agent not found");
+    const def = storage.getAgentDefinition(agent.definitionId);
+    if (!def) throw new ApiError(404, "not_found", "Agent definition not found");
+
+    const { getAgentDocs } = await import("./skillsRuntime");
+    const docs = await getAgentDocs(def.id);
+    if (!docs) throw new ApiError(404, "not_found", "Agent docs not found");
+    const skills = await getEffectiveDefinitionSkills(tenantId, def.id);
+
+    res.json({
+      tenant: { id: tenant.id, name: tenant.name },
+      agent: { id: agent.id, displayName: agent.displayName, role: agent.role, definitionId: agent.definitionId },
+      definition: { id: def.id, name: def.name, division: def.division },
+      files: [
+        { filename: "SOUL.md", markdown: docs.SOUL.markdown },
+        { filename: "AGENT.md", markdown: docs.AGENT.markdown },
+        { filename: "HEARTBEAT.md", markdown: docs.HEARTBEAT.markdown },
+        { filename: "TOOLS.md", markdown: docs.TOOLS.markdown },
+        { filename: "SKILLS.md", markdown: skills.markdown },
+      ],
+    });
+  });
+
+  // Export a team as a zip: includes team instruction files + docs for each team member agent.
+  app.get("/api/tenants/:tenantId/teams/:teamId/export", async (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const teamId = Number(req.params.teamId);
+    const tenant = storage.getTenant(tenantId);
+    const team = storage.getTeam(teamId);
+    if (!tenant) throw new ApiError(404, "not_found", "Tenant not found");
+    if (!team || team.tenantId !== tenantId) throw new ApiError(404, "not_found", "Team not found");
+
+    const rootPath = teamInstructionsRoot(tenantId, teamId);
+    ensureDir(rootPath);
+
+    const members = storage.getTeamMembers(teamId);
+    const agents = members
+      .map((m) => storage.getAgent(m.agentId))
+      .filter(Boolean)
+      .filter((a) => (a as any).tenantId === tenantId) as any[];
+
+    const { getAgentDocs } = await import("./skillsRuntime");
+
+    const zip = await new Promise<Buffer>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      const writeable = new Writable({
+        write(chunk, _encoding, cb) {
+          chunks.push(chunk as Buffer);
+          cb();
+        },
+      });
+
+      const archive = archiver("zip", { zlib: { level: 9 } });
+      archive.on("error", reject);
+      archive.on("warning", (err) => {
+        if ((err as any)?.code !== "ENOENT") reject(err);
+      });
+      writeable.on("finish", () => resolve(Buffer.concat(chunks)));
+      archive.pipe(writeable);
+
+      // Team files
+      const teamFiles = listMarkdownFiles(rootPath);
+      for (const filename of teamFiles) {
+        const full = safeJoin(rootPath, filename);
+        if (fs.existsSync(full)) {
+          archive.file(full, { name: `team/${filename}` });
+        }
+      }
+
+      // Agent docs for members (generated on the fly)
+      (async () => {
+        for (const a of agents) {
+          const def = storage.getAgentDefinition(a.definitionId);
+          if (!def) continue;
+          const docs = await getAgentDocs(def.id);
+          if (!docs) continue;
+          const skills = await getEffectiveDefinitionSkills(tenantId, def.id);
+          const folder = `agents/${safeSlug(a.displayName)}_${a.id}`;
+          archive.append(docs.SOUL.markdown, { name: `${folder}/SOUL.md` });
+          archive.append(docs.AGENT.markdown, { name: `${folder}/AGENT.md` });
+          archive.append(docs.HEARTBEAT.markdown, { name: `${folder}/HEARTBEAT.md` });
+          archive.append(docs.TOOLS.markdown, { name: `${folder}/TOOLS.md` });
+          archive.append(skills.markdown, { name: `${folder}/SKILLS.md` });
+        }
+        archive.finalize();
+      })().catch(reject);
+    });
+
+    const safeName = safeSlug(team.name || "team");
+    res.set("Content-Type", "application/zip");
+    res.set("Content-Disposition", `attachment; filename=\"team-${safeName}-${teamId}.zip\"`);
+    res.send(zip);
+  });
+
   // ─── Tasks ────────────────────────────────────────────────────────────────
   app.get("/api/tenants/:tenantId/tasks", (req, res) =>
     res.json(storage.getTasks(Number(req.params.tenantId)))
@@ -1521,7 +1962,13 @@ export async function registerRoutes(httpServer: Server, app: Express) {
     const task = storage.getTask(taskId);
     if (!task || task.tenantId !== tenantId) throw new ApiError(404, "not_found", "Task not found");
 
-    const allMessages = storage.getMessages(tenantId, "general");
+    // Scan all relevant channels (general + all team channels) so deliverables can be extracted
+    // even when agents post their work in a team channel (Collaboration).
+    const channelIds: string[] = ["general"];
+    const teams = storage.getTeams(tenantId);
+    for (const t of teams) channelIds.push(`team-${t.id}`);
+
+    const allMessages = channelIds.flatMap((cid) => storage.getMessages(tenantId, cid));
     let totalFiles = 0;
     for (const msg of allMessages) {
       if (!msg.senderAgentId || !msg.content.includes("```")) continue;

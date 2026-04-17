@@ -616,6 +616,30 @@ export async function hermesRunOnce(
           cost: costUsd,
         });
 
+        // Report upward to the assigned agent's head/manager so they can approve or request changes.
+        if (agent.managerId) {
+          const head = storage.getAgent(agent.managerId);
+          if (head && head.tenantId === tenantId) {
+            const note = `@${head.displayName} — Task #${task.id} is ready for review: "${task.title}". Approve or Request Changes in Tasks.`;
+            try {
+              const headMsg = storage.createMessage({
+                tenantId,
+                channelId: `dm-${head.id}`,
+                channelType: "dm",
+                senderAgentId: agentId,
+                senderName: `${agent.displayName} (${agent.role})`,
+                senderEmoji: def.emoji ?? "🤖",
+                content: note,
+                messageType: "chat",
+                metadata: { taskId: task.id, review: true },
+              } as any);
+              addRunEvent(run.id, { kind: "stdout", message: `notified head via dm-${head.id} (#${headMsg.id})` });
+            } catch {
+              // best-effort
+            }
+          }
+        }
+
         if (task.teamId) {
           const teamMsg = storage.createMessage({
             tenantId,

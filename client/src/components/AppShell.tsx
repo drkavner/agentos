@@ -42,6 +42,7 @@ const NAV = [
     items: [
       { href: "/tasks", icon: CheckSquare, label: "Tasks" },
       { href: "/collab", icon: MessageSquare, label: "Collaboration" },
+      { href: "/teams", icon: Users, label: "Teams" },
       { href: "/audit", icon: ScrollText, label: "Audit Log" },
       { href: "/ceo/dashboard", icon: Crown, label: "CEO" },
     ],

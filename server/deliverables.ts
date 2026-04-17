@@ -50,6 +50,19 @@ export function extractCodeFiles(markdown: string): ExtractedFile[] {
       continue;
     }
 
+    // Support "heading + code fence on same line", e.g.:
+    // ## File: wellness/KPIS.md ```md
+    const headingAndFence = line.match(
+      /^#{1,4}\s+(?:📁\s*)?(?:File:\s*)?[`"']?([^\s`"'#][^`"'#]*\.\w{1,10})[`"']?\s+```(\w*)\s*$/i,
+    );
+    if (headingAndFence) {
+      pendingFilename = cleanFilename(headingAndFence[1]!);
+      inCodeBlock = true;
+      codeBlockLang = headingAndFence[2] || "";
+      codeLines = [];
+      continue;
+    }
+
     const codeStart = line.match(/^```(\w*)/);
     if (codeStart) {
       inCodeBlock = true;
@@ -100,6 +113,15 @@ export function extractCodeFiles(markdown: string): ExtractedFile[] {
       pendingFilename = cleanFilename(markdownBoldFile[1]!);
       continue;
     }
+  }
+
+  // If the model forgot to close the final ``` fence, still salvage the file.
+  if (inCodeBlock && pendingFilename && codeLines.length > 0) {
+    files.push({
+      filename: pendingFilename,
+      language: codeBlockLang,
+      content: codeLines.join("\n"),
+    });
   }
 
   return files;

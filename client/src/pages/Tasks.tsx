@@ -860,14 +860,14 @@ export default function Tasks() {
                           {t.status === "review" && (
                             <>
                               <button
-                                onClick={() => approveTask.mutate(t.id)}
+                                onClick={(e) => { e.stopPropagation(); approveTask.mutate(t.id); }}
                                 className="text-green-400 hover:text-green-300 transition-colors"
                                 title="Approve"
                               >
                                 <ThumbsUp className="w-3.5 h-3.5" />
                               </button>
                               <button
-                                onClick={() => { setRejectTaskId(t.id); setRejectFeedback(""); }}
+                                onClick={(e) => { e.stopPropagation(); setRejectTaskId(t.id); setRejectFeedback(""); }}
                                 className="text-orange-400 hover:text-orange-300 transition-colors"
                                 title="Request Changes"
                               >
