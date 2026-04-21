@@ -59,6 +59,13 @@ import {
 } from "./ceoControl";
 import { createDefaultCeoForTenant } from "./ceoBootstrap";
 import { maybeDelegateCeoIncomingTask, maybeAutoCloseParentCeoTask } from "./ceoDelegation";
+import {
+  getMergedAgentDocsForDeployed,
+  materializeDefaultAgentInstanceDocs,
+  parseAgentDocFilesFromBody,
+  stripAgentDocFilesFromBody,
+  writeAgentInstanceDocOverlays,
+} from "./agentInstanceDocs";
 
 // dispatchAgentRun imported from ./dispatchAgentRun
 
@@ -103,6 +110,147 @@ function zodDetails(error: unknown) {
   // Keep response small + consistent for clients.
   // (ZodError has .issues, but we avoid importing Zod types here.)
   return error;
+}
+
+/** Normalize JSON from "Import agent" (flat hire body, or bundle like GET /agents/:id/docs + nested agent/runtime). */
+function normalizeAgentImportPayload(raw: unknown): Record<string, unknown> {
+  if (raw == null || typeof raw !== "object") {
+    throw new ApiError(400, "validation_error", "Import payload must be a JSON object");
+  }
+  const r = raw as Record<string, unknown>;
+  const wrapped = (r as any).import != null ? (r as any).import : raw;
+  if (wrapped == null || typeof wrapped !== "object") {
+    throw new ApiError(400, "validation_error", "Import payload must be a JSON object");
+  }
+  const w = wrapped as any;
+  let base: Record<string, unknown>;
+  if (w.agent && typeof w.agent === "object") {
+    base = { ...(w.agent as Record<string, unknown>) };
+    if (w.definition && typeof w.definition === "object") {
+      const d = w.definition as Record<string, unknown>;
+      if (base.definitionId == null && d.id != null) base.definitionId = d.id;
+      if (base.definitionName == null && d.name != null) base.definitionName = d.name;
+    }
+    if (w.runtime && typeof w.runtime === "object") {
+      Object.assign(base, w.runtime as Record<string, unknown>);
+    }
+  } else {
+    base = { ...(wrapped as Record<string, unknown>) };
+  }
+  delete base.id;
+  delete (base as any).tenantId;
+  delete (base as any).tasksCompleted;
+  delete (base as any).spentThisMonth;
+  delete (base as any).lastHeartbeat;
+  delete (base as any).tenant;
+  delete (base as any).definition;
+  return base;
+}
+
+function resolveDefinitionIdForImport(body: Record<string, unknown>): number {
+  const id = Number(body.definitionId);
+  if (Number.isFinite(id) && id > 0) {
+    const def = storage.getAgentDefinition(id);
+    if (def) return id;
+  }
+  const name = String(body.definitionName ?? "").trim().toLowerCase();
+  if (!name) {
+    throw new ApiError(400, "validation_error", "Provide definitionId or definitionName to import an agent");
+  }
+  const defs = storage.getAgentDefinitions();
+  const hit = defs.find((d) => String(d.name).trim().toLowerCase() === name);
+  if (!hit) {
+    throw new ApiError(400, "validation_error", `Unknown definitionName "${String(body.definitionName)}"`);
+  }
+  return hit.id;
+}
+
+async function hireAgentForTenantInternal(
+  tenantId: number,
+  reqBody: Record<string, unknown>,
+  opts?: { auditDetail?: string },
+) {
+  const tenant = storage.getTenant(tenantId);
+  if (!tenant) throw new ApiError(404, "not_found", "Tenant not found");
+  const current = storage.getAgents(tenantId);
+  if (current.length >= tenant.maxAgents) {
+    throw new ApiError(
+      403,
+      "agent_limit_reached",
+      `Agent limit reached. This organization is capped at ${tenant.maxAgents} agents. Ask your admin to raise the limit in Settings.`,
+      { limit: tenant.maxAgents, current: current.length },
+    );
+  }
+  const hireBody: Record<string, unknown> = { ...reqBody, tenantId };
+  const docFileOverlays = parseAgentDocFilesFromBody(hireBody);
+  stripAgentDocFilesFromBody(hireBody);
+  if (hireBody.managerId != null) {
+    const mid = Number(hireBody.managerId);
+    const m = storage.getAgent(mid);
+    if (!m || m.tenantId !== tenantId) delete hireBody.managerId;
+  }
+  const llmProvider = normalizeLlmRouting(hireBody.llmProvider);
+  delete hireBody.llmProvider;
+  const rawAdapterType = String(hireBody.adapterType ?? "hermes").toLowerCase();
+  delete hireBody.adapterType;
+  const rawCommand = String(hireBody.command ?? "").trim();
+  delete hireBody.command;
+  const rawModel = String(hireBody.runtimeModel ?? "").trim();
+  delete hireBody.runtimeModel;
+  const rawThinkingEffort = String(hireBody.thinkingEffort ?? "auto");
+  delete hireBody.thinkingEffort;
+  const rawExtraArgs = String(hireBody.extraArgs ?? "");
+  delete hireBody.extraArgs;
+  const rawHeartbeatEnabled = hireBody.heartbeatEnabled !== undefined ? !!hireBody.heartbeatEnabled : true;
+  delete hireBody.heartbeatEnabled;
+  delete hireBody.definitionName;
+
+  const parsed = insertAgentSchema.safeParse(hireBody);
+  if (!parsed.success) throw new ApiError(400, "validation_error", "Invalid request", zodDetails(parsed.error));
+
+  if (!parsed.data.managerId) {
+    const existing = storage.getAgents(tenantId);
+    const ceo = existing.find((a) => a.role === "CEO");
+    if (ceo) parsed.data.managerId = ceo.id;
+  }
+
+  const agent = storage.createAgent(parsed.data);
+  ensureAgentConfigurationTables();
+
+  const adapterType = (["hermes", "openclaw", "cli"].includes(rawAdapterType) ? rawAdapterType : "hermes") as any;
+  upsertAgentRuntimeSettings(agent.id, {
+    llmProvider,
+    adapterType,
+    command: rawCommand,
+    model: rawModel,
+    thinkingEffort: (["auto", "low", "medium", "high"].includes(rawThinkingEffort) ? rawThinkingEffort : "auto") as any,
+    extraArgs: rawExtraArgs,
+    heartbeatEnabled: rawHeartbeatEnabled,
+  });
+  auditAndInvalidate(tenantId, ["agents"], {
+    agentId: agent.id,
+    agentName: agent.displayName,
+    action: "agent_hired",
+    entity: "agent",
+    entityId: String(agent.id),
+    detail: opts?.auditDetail ?? `Deployed ${agent.displayName} as ${agent.role}`,
+    tokensUsed: 0,
+    cost: 0,
+  });
+  await materializeDefaultAgentInstanceDocs(tenantId, agent.id, agent.definitionId);
+  if (docFileOverlays.length) {
+    await writeAgentInstanceDocOverlays(tenantId, agent.id, docFileOverlays);
+  }
+  if (String(agent.status) === "running") {
+    void (async () => {
+      try {
+        await dispatchAgentRun(tenantId, agent.id, { reason: "start" });
+      } catch {
+        // ignore
+      }
+    })();
+  }
+  return agent;
 }
 
 export async function registerRoutes(httpServer: Server, app: Express) {
@@ -230,7 +378,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
     res.json({ ok: true, configured: saved.configured, updatedAt: saved.updatedAt });
   });
 
-  app.post("/api/tenants", (req, res) => {
+  app.post("/api/tenants", async (req, res) => {
     const parsed = insertTenantSchema.safeParse(req.body);
     if (!parsed.success) throw new ApiError(400, "validation_error", "Invalid request", zodDetails(parsed.error));
     const { ceoLlmProvider, ceoModel, useCeoAgent, ...tenantData } = parsed.data as any;
@@ -281,7 +429,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
       const mapped = cliAdapterMap[orgAdapter] ?? { adapterType: "hermes" as const, command: "" };
 
       try {
-        createDefaultCeoForTenant(t.id, t.name, {
+        await createDefaultCeoForTenant(t.id, t.name, {
           llmProvider: ceoLlmProvider,
           model: ceoModel,
           adapterType: mapped.adapterType,
@@ -725,78 +873,21 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   app.get("/api/tenants/:tenantId/agents", (req, res) =>
     res.json(storage.getAgents(Number(req.params.tenantId)))
   );
-  app.post("/api/tenants/:tenantId/agents", (req, res) => {
+  app.post("/api/tenants/:tenantId/agents", async (req, res) => {
     const tenantId = Number(req.params.tenantId);
-    const tenant = storage.getTenant(tenantId);
-    if (!tenant) throw new ApiError(404, "not_found", "Tenant not found");
-    // Enforce agent cap
-    const current = storage.getAgents(tenantId);
-    if (current.length >= tenant.maxAgents) {
-      throw new ApiError(
-        403,
-        "agent_limit_reached",
-        `Agent limit reached. This organization is capped at ${tenant.maxAgents} agents. Ask your admin to raise the limit in Settings.`,
-        { limit: tenant.maxAgents, current: current.length },
-      );
-    }
-    const hireBody: Record<string, unknown> = { ...(req.body as object), tenantId };
-    const llmProvider = normalizeLlmRouting(hireBody.llmProvider);
-    delete hireBody.llmProvider;
-    const rawAdapterType = String(hireBody.adapterType ?? "hermes").toLowerCase();
-    delete hireBody.adapterType;
-    const rawCommand = String(hireBody.command ?? "").trim();
-    delete hireBody.command;
-    const rawModel = String(hireBody.runtimeModel ?? "").trim();
-    delete hireBody.runtimeModel;
-    const rawThinkingEffort = String(hireBody.thinkingEffort ?? "auto");
-    delete hireBody.thinkingEffort;
-    const rawExtraArgs = String(hireBody.extraArgs ?? "");
-    delete hireBody.extraArgs;
-    const rawHeartbeatEnabled = hireBody.heartbeatEnabled !== undefined ? !!hireBody.heartbeatEnabled : true;
-    delete hireBody.heartbeatEnabled;
+    const agent = await hireAgentForTenantInternal(tenantId, { ...(req.body as object) });
+    res.json(agent);
+  });
 
-    const parsed = insertAgentSchema.safeParse(hireBody);
-    if (!parsed.success) throw new ApiError(400, "validation_error", "Invalid request", zodDetails(parsed.error));
-
-    // Auto-assign to CEO if no manager specified
-    if (!parsed.data.managerId) {
-      const existing = storage.getAgents(tenantId);
-      const ceo = existing.find((a) => a.role === "CEO");
-      if (ceo) parsed.data.managerId = ceo.id;
-    }
-
-    const agent = storage.createAgent(parsed.data);
-    ensureAgentConfigurationTables();
-
-    const adapterType = (["hermes", "openclaw", "cli"].includes(rawAdapterType) ? rawAdapterType : "hermes") as any;
-    upsertAgentRuntimeSettings(agent.id, {
-      llmProvider,
-      adapterType,
-      command: rawCommand,
-      model: rawModel,
-      thinkingEffort: (["auto", "low", "medium", "high"].includes(rawThinkingEffort) ? rawThinkingEffort : "auto") as any,
-      extraArgs: rawExtraArgs,
-      heartbeatEnabled: rawHeartbeatEnabled,
+  /** Import a deployed agent from JSON (e.g. copied from another org or a saved bundle with agent + definition + runtime). */
+  app.post("/api/tenants/:tenantId/agents/import", async (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const raw = (req.body as any)?.import ?? req.body;
+    const body = normalizeAgentImportPayload(raw);
+    body.definitionId = resolveDefinitionIdForImport(body);
+    const agent = await hireAgentForTenantInternal(tenantId, body, {
+      auditDetail: `Imported ${String(body.displayName ?? "agent")} as ${String(body.role ?? "role")}`,
     });
-    auditAndInvalidate(tenantId, ["agents"], {
-      agentId: agent.id,
-      agentName: agent.displayName,
-      action: "agent_hired",
-      entity: "agent",
-      entityId: String(agent.id),
-      detail: `Deployed ${agent.displayName} as ${agent.role}`,
-      tokensUsed: 0,
-      cost: 0,
-    });
-    if (String(agent.status) === "running") {
-      void (async () => {
-        try {
-          await dispatchAgentRun(tenantId, agent.id, { reason: "start" });
-        } catch {
-          // ignore
-        }
-      })();
-    }
     res.json(agent);
   });
 
@@ -1601,10 +1692,8 @@ export async function registerRoutes(httpServer: Server, app: Express) {
     const def = storage.getAgentDefinition(agent.definitionId);
     if (!def) throw new ApiError(404, "not_found", "Agent definition not found");
 
-    const { getAgentDocs } = await import("./skillsRuntime");
-    const docs = await getAgentDocs(def.id);
+    const docs = await getMergedAgentDocsForDeployed(tenantId, agent.id, def.id);
     if (!docs) throw new ApiError(404, "not_found", "Agent docs not found");
-    const skills = await getEffectiveDefinitionSkills(tenantId, def.id);
 
     res.json({
       tenant: { id: tenant.id, name: tenant.name },
@@ -1615,7 +1704,7 @@ export async function registerRoutes(httpServer: Server, app: Express) {
         { filename: "AGENT.md", markdown: docs.AGENT.markdown },
         { filename: "HEARTBEAT.md", markdown: docs.HEARTBEAT.markdown },
         { filename: "TOOLS.md", markdown: docs.TOOLS.markdown },
-        { filename: "SKILLS.md", markdown: skills.markdown },
+        { filename: "SKILLS.md", markdown: docs.SKILLS.markdown },
       ],
     });
   });
@@ -1637,8 +1726,6 @@ export async function registerRoutes(httpServer: Server, app: Express) {
       .map((m) => storage.getAgent(m.agentId))
       .filter(Boolean)
       .filter((a) => (a as any).tenantId === tenantId) as any[];
-
-    const { getAgentDocs } = await import("./skillsRuntime");
 
     const zip = await new Promise<Buffer>((resolve, reject) => {
       const chunks: Buffer[] = [];
@@ -1671,15 +1758,14 @@ export async function registerRoutes(httpServer: Server, app: Express) {
         for (const a of agents) {
           const def = storage.getAgentDefinition(a.definitionId);
           if (!def) continue;
-          const docs = await getAgentDocs(def.id);
+          const docs = await getMergedAgentDocsForDeployed(tenantId, a.id, def.id);
           if (!docs) continue;
-          const skills = await getEffectiveDefinitionSkills(tenantId, def.id);
           const folder = `agents/${safeSlug(a.displayName)}_${a.id}`;
           archive.append(docs.SOUL.markdown, { name: `${folder}/SOUL.md` });
           archive.append(docs.AGENT.markdown, { name: `${folder}/AGENT.md` });
           archive.append(docs.HEARTBEAT.markdown, { name: `${folder}/HEARTBEAT.md` });
           archive.append(docs.TOOLS.markdown, { name: `${folder}/TOOLS.md` });
-          archive.append(skills.markdown, { name: `${folder}/SKILLS.md` });
+          archive.append(docs.SKILLS.markdown, { name: `${folder}/SKILLS.md` });
         }
         archive.finalize();
       })().catch(reject);

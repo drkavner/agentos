@@ -3,7 +3,8 @@ import { db } from "./db";
 import { and, eq, isNull, ne, desc, like } from "drizzle-orm";
 import { messages, tasks, teamMembers } from "@shared/schema";
 import { parentTaskMarker, maybeAutoCloseParentCeoTask } from "./ceoDelegation";
-import { getEffectiveDefinitionSkills } from "./skillsRuntime";
+import { getEffectiveDefinitionSkills, getAgentDocsSync, type AgentDocs } from "./skillsRuntime";
+import { getMergedAgentDocsForDeployed } from "./agentInstanceDocs";
 import { buildAgentSystemPrompt } from "./agentPrompts";
 import { completeLlmChat, getOpenRouterApiKey, resolveOllamaBaseUrl } from "./llmClient";
 import { auditAndInvalidate, invalidateTenant } from "./realtimeSideEffects";
@@ -18,8 +19,6 @@ import {
   upsertAgentRuntimeSettings,
 } from "./agentConfiguration";
 import { addRunEvent, createAgentRun, finishAgentRun, type RunTrigger } from "./agentRuns";
-import { getAgentDocsSync } from "./skillsRuntime";
-
 async function completeViaHermesAgentCli(opts: {
   provider: "openrouter" | "ollama";
   model: string;
@@ -116,13 +115,13 @@ function generateAutonomousSimMessage(
   lastMsg: { senderName: string; senderAgentId: number | null; content: string } | undefined | null,
   reason: string,
   skillBullets: string[],
+  docs: AgentDocs,
 ): string {
   const role = agent.role;
   const specialty = def.specialty.split(",").map((s) => s.trim()).filter(Boolean);
   const topSkill = specialty[0] ?? role;
-  const docs = getAgentDocsSync(agent.definitionId);
-  const soulIdentity = docs?.SOUL?.markdown?.match(/## Identity\n([\s\S]*?)(?=\n##|$)/)?.[1]?.trim() ?? "";
-  const soulPurpose = docs?.SOUL?.markdown?.match(/## Core Purpose\n([\s\S]*?)(?=\n##|$)/)?.[1]?.trim() ?? def.description;
+  const soulIdentity = docs.SOUL.markdown.match(/## Identity\n([\s\S]*?)(?=\n##|$)/)?.[1]?.trim() ?? "";
+  const soulPurpose = docs.SOUL.markdown.match(/## Core Purpose\n([\s\S]*?)(?=\n##|$)/)?.[1]?.trim() ?? def.description;
 
   const replyTo =
     lastMsg && lastMsg.senderAgentId !== agent.id && lastMsg.senderAgentId != null
@@ -287,6 +286,8 @@ export async function hermesRunOnce(
 
   try {
     const skills = await getEffectiveDefinitionSkills(tenantId, def.id);
+    const mergedAgentDocs = await getMergedAgentDocsForDeployed(tenantId, agentId, def.id);
+    const simAgentDocs = mergedAgentDocs ?? getAgentDocsSync(agent.definitionId)!;
     const task = pickWorkTask(tenantId, agentId);
 
     let tokensUsed = estimateTokensFromSkills(skills.markdown);
@@ -492,7 +493,7 @@ export async function hermesRunOnce(
           message: "llm: skipped (set OPENROUTER_API_KEY on the server for OpenRouter routing)",
         });
       }
-      assistantBody = generateAutonomousSimMessage(agent, def, task, lastMsg, reason, bullets);
+      assistantBody = generateAutonomousSimMessage(agent, def, task, lastMsg, reason, bullets, simAgentDocs);
     }
 
     let deliverableFiles: string[] = [];

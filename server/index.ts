@@ -84,7 +84,7 @@ app.use((req, res, next) => {
   if (shouldSeed) seedDatabase();
 
   await registerRoutes(httpServer, app);
-  repairAllTenantsMissingCeo();
+  await repairAllTenantsMissingCeo().catch((e) => console.error("[ceo-bootstrap] repairAllTenantsMissingCeo failed:", e));
   startHeartbeatRunner();
 
   app.use((err: any, _req: Request, res: Response, next: NextFunction) => {

@@ -4,6 +4,7 @@ import { ensureAgentDefinitionsCatalog } from "./agentDefinitionsCatalog";
 import { upsertAgentRuntimeSettings } from "./agentConfiguration";
 import { auditAndInvalidate } from "./realtimeSideEffects";
 import { getCeoControlSettings } from "./ceoControl";
+import { materializeDefaultAgentInstanceDocs } from "./agentInstanceDocs";
 
 const DEFAULT_CEO_FILES: Record<string, string> = {
   "AGENTS.md": `You are the CEO. Your job is to lead the company, not to do individual contributor work.\nYou own strategy, prioritization, and cross-functional coordination.\n\n## Delegation (critical)\nYou MUST delegate work rather than doing it yourself.\n\nRouting rules:\n- Code, bugs, features, infra, devtools → CTO\n- Marketing, content, social media, growth, devrel → CMO\n- UX, design, user research, design-system → UXDesigner\n`,
@@ -16,7 +17,7 @@ const DEFAULT_CEO_FILES: Record<string, string> = {
  * Creates the default CEO agent + instruction files for a tenant.
  * Caller must ensure the tenant row already exists.
  */
-export function createDefaultCeoForTenant(
+export async function createDefaultCeoForTenant(
   tenantId: number,
   tenantName: string,
   opts?: {
@@ -94,11 +95,12 @@ export function createDefaultCeoForTenant(
     cost: 0,
   });
 
+  await materializeDefaultAgentInstanceDocs(tenantId, ceo.id, orchestrator.id);
   return ceo;
 }
 
 /** Backfills CEO for any tenant that is missing one (fixes partial failures + old DBs). */
-export function repairAllTenantsMissingCeo() {
+export async function repairAllTenantsMissingCeo() {
   try {
     ensureAgentDefinitionsCatalog();
   } catch (e) {
@@ -112,7 +114,7 @@ export function repairAllTenantsMissingCeo() {
     const hasCeo = agents.some((a) => String(a.role).toLowerCase() === "ceo");
     if (hasCeo) continue;
     try {
-      createDefaultCeoForTenant(t.id, t.name, {
+      await createDefaultCeoForTenant(t.id, t.name, {
         agentHiredDetail: `Backfilled missing CEO for organization "${t.name}"`,
         filesDetail: "Backfilled default CEO instruction files",
       });

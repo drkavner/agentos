@@ -1,7 +1,7 @@
 import { storage } from "./storage";
 import { getEffectiveDefinitionSkills } from "./skillsRuntime";
-import { getAgentDocs } from "./skillsRuntime";
 import { ensureAgentConfigurationTables, getAgentRuntimeSettings } from "./agentConfiguration";
+import { agentInstanceHasSkillsFile, getMergedAgentDocsForDeployed } from "./agentInstanceDocs";
 
 /** Shared system prompt for Hermes runs and `runtime-context` API. */
 export async function buildAgentSystemPrompt(tenantId: number, agentId: number): Promise<string> {
@@ -14,7 +14,8 @@ export async function buildAgentSystemPrompt(tenantId: number, agentId: number):
   if (!def) throw new Error("buildAgentSystemPrompt: agent definition not found");
 
   const skills = await getEffectiveDefinitionSkills(tenantId, def.id);
-  const docs = await getAgentDocs(def.id);
+  const docs = await getMergedAgentDocsForDeployed(tenantId, agentId, def.id);
+  const useInstanceSkillsFile = agentInstanceHasSkillsFile(tenantId, agentId);
   ensureAgentConfigurationTables();
   const runtime = getAgentRuntimeSettings(agentId);
 
@@ -66,8 +67,10 @@ COMMUNICATION STYLE:
     sections.push(docs.TOOLS.markdown);
   }
 
-  sections.push(`## Skills (source: ${skills.source}${skills.updatedAt ? `, updatedAt: ${skills.updatedAt}` : ""})
-${skills.markdown}`);
+  const skillsHeaderSource = useInstanceSkillsFile ? "instance SKILLS.md" : skills.source;
+  const skillsHeaderMeta = !useInstanceSkillsFile && skills.updatedAt ? `, updatedAt: ${skills.updatedAt}` : "";
+  sections.push(`## Skills (source: ${skillsHeaderSource}${skillsHeaderMeta})
+${docs ? docs.SKILLS.markdown : skills.markdown}`);
 
   sections.push(`## Runtime Settings
 - model: ${runtime.model || agent.model}
