@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
-import { apiRequest, queryClient } from "@/lib/queryClient";
+import { apiRequest, queryClient, readJsonOrApiHint } from "@/lib/queryClient";
 import type { Agent, AgentDefinition, Tenant } from "@shared/schema";
 import { useTenantContext } from "@/tenant/TenantContext";
 import { Card, CardContent } from "@/components/ui/card";
@@ -12,6 +12,7 @@ import {
   ArrowLeft,
   ArrowRight,
   Bot,
+  Check,
   CheckCircle,
   Clock,
   Cpu,
@@ -24,13 +25,14 @@ import {
   Trash2,
   Upload,
 } from "lucide-react";
-import { cn, formatDistanceToNow } from "@/lib/utils";
+import { cn, deployedAgentEmoji, formatDistanceToNow } from "@/lib/utils";
 import { useToast } from "@/hooks/use-toast";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { ScrollArea, ScrollBar } from "@/components/ui/scroll-area";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
@@ -38,14 +40,19 @@ import {
 } from "@/components/ui/alert-dialog";
 import { HireAgentWizard } from "@/components/HireAgentWizard";
 import { AddAgentDialog } from "@/components/AddAgentDialog";
+import { EmojiPicker } from "@/components/EmojiPicker";
 import {
   appendImportExtrasToAgentMarkdown,
+  parseImportedBundleEntries,
+  extractImportedBundlePaths,
+  extractImportedBundleSection,
   IMPORT_DOC_FILENAMES,
   MAX_IMPORT_ZIP_ARCHIVE_BYTES,
   parseImportUploadFiles,
   type ImportBundleExtraText,
   type ImportDocFilename,
 } from "@/lib/parseAgentImportUpload";
+import { OPENROUTER_MODELS } from "@/lib/openrouterModels";
 
 const STATUS_CONFIG: Record<string, { label: string; dot: string; badge: string }> = {
   running: { label: "Running", dot: "bg-green-500 status-running", badge: "bg-green-500/10 text-green-400 border-green-500/20" },
@@ -66,6 +73,9 @@ const IMPORT_DOC_FILES = IMPORT_DOC_FILENAMES.map((filename) => ({
   filename,
   description: IMPORT_DOC_DESCRIPTIONS[filename],
 }));
+
+/** Keys returned by `GET …/runtime-context` → `mergedInstructionDocs` (same order as on-disk bundle). */
+const DEPLOYED_INSTRUCTION_DOC_KEYS = ["SOUL", "AGENT", "HEARTBEAT", "TOOLS", "SKILLS"] as const;
 
 const MODEL_LABELS: Record<string, string> = {
   "claude-opus-4": "Claude Opus 4",
@@ -121,6 +131,8 @@ export default function MyAgents() {
   const [importZipDetectedPaths, setImportZipDetectedPaths] = useState<string[]>([]);
   /** Non-canonical text from zip/folder — merged into AGENT.md on Import for Cortex. */
   const [importBundleExtraText, setImportBundleExtraText] = useState<ImportBundleExtraText[]>([]);
+  /** Manifest of scanned paths (used to show “all .md files” after import). */
+  const [importBundleMatchedPaths, setImportBundleMatchedPaths] = useState<string[]>([]);
   /** Inline message in the import dialog (validation, parse, upload read, API errors) — no corner toasts for these. */
   const [importWizardError, setImportWizardError] = useState<string | null>(null);
   const [importAdapterUiId, setImportAdapterUiId] = useState<ImportAdapterUiId>("hermes");
@@ -136,9 +148,13 @@ export default function MyAgents() {
     enabled: tid > 0,
   });
 
-  const { data: agents = [], isLoading } = useQuery<Agent[]>({
+  const { data: agents = [], isLoading } = useQuery<(Agent & { cardModel?: string })[]>({
     queryKey: ["/api/tenants", tid, "agents"],
-    queryFn: () => apiRequest("GET", `/api/tenants/${tid}/agents`).then(r => r.json()),
+    queryFn: () => apiRequest("GET", `/api/tenants/${tid}/agents`).then((r) => r.json()),
+    enabled: tid > 0,
+    /** Global default is staleTime: Infinity — without this, cards never pick up cardModel / emoji after server fixes. */
+    staleTime: 0,
+    refetchOnMount: "always",
   });
 
   const visibleAgents = useMemo(() => {
@@ -194,6 +210,18 @@ export default function MyAgents() {
     }
   }, [importJson]);
 
+  /** Definition row for the import draft (picker default + review copy). */
+  const importReviewDef = useMemo(() => {
+    const id = Number(importDraftObject.definitionId);
+    if (Number.isFinite(id) && id > 0) {
+      const byId = defs.find((d) => d.id === id);
+      if (byId) return byId;
+    }
+    const name = String(importDraftObject.definitionName ?? "").trim().toLowerCase();
+    if (name) return defs.find((d) => String(d.name).trim().toLowerCase() === name) ?? null;
+    return null;
+  }, [importDraftObject.definitionId, importDraftObject.definitionName, defs]);
+
   /** Merge fields into hire JSON; pass `undefined` as a value to remove a key (e.g. clear definitionId when picking by name). */
   const patchImportJson = useCallback((patch: Record<string, unknown | undefined>) => {
     setImportJson((prev) => {
@@ -216,6 +244,36 @@ export default function MyAgents() {
     queryKey: ["/api/tenants", tid],
     queryFn: () => apiRequest("GET", `/api/tenants/${tid}`).then(r => r.json()),
   });
+
+  const { data: importOllamaModelsRes, isLoading: importOllamaModelsLoading, isError: importOllamaModelsError } = useQuery<{
+    baseUsed: string;
+    models: string[];
+  }>({
+    queryKey: ["/api/tenants", tid, "ollama", "models", "import", tenant?.ollamaBaseUrl ?? ""],
+    queryFn: () => apiRequest("GET", `/api/tenants/${tid}/ollama/models`).then((r) => readJsonOrApiHint(r)),
+    enabled: importOpen && tid > 0 && importWizardStep === 1 && importLlmProvider === "ollama",
+    retry: false,
+  });
+
+  useEffect(() => {
+    if (importLlmProvider !== "ollama") return;
+    const list = importOllamaModelsRes?.models;
+    if (!list?.length) return;
+    setImportRuntimeModel((prev) => {
+      const cur = prev.trim();
+      if (cur && list.includes(cur)) return prev;
+      return list[0]!;
+    });
+  }, [importLlmProvider, importOllamaModelsRes?.models]);
+
+  /** OpenRouter: default model when Runtime step opens so import payload always carries runtimeModel. */
+  useEffect(() => {
+    if (!importOpen || importWizardStep !== 1) return;
+    if (importLlmProvider !== "openrouter") return;
+    if (importRuntimeModel.trim()) return;
+    const free = OPENROUTER_MODELS.find((m) => m.id.endsWith(":free"))?.id ?? OPENROUTER_MODELS[0]?.id;
+    if (free) setImportRuntimeModel(free);
+  }, [importOpen, importWizardStep, importLlmProvider, importRuntimeModel]);
 
   useEffect(() => {
     setImportCommand(importAdapterDefaultCmd(importAdapterUiId));
@@ -253,6 +311,7 @@ export default function MyAgents() {
     setImportWizardStep(0);
     setImportZipDetectedPaths([]);
     setImportBundleExtraText([]);
+    setImportBundleMatchedPaths([]);
     const orgAdapter = String(tenant?.adapterType ?? "hermes").toLowerCase();
     setImportAdapterUiId(orgAdapter === "openclaw" ? "openclaw" : "hermes");
     setImportLlmProvider("openrouter");
@@ -270,17 +329,13 @@ export default function MyAgents() {
   );
 
   const { data: runtimeCtx } = useQuery<any>({
-    queryKey: ["/api/tenants", tid, "agents", selectedAgent?.id ?? 0, "runtime-context"],
+    // Bump key when runtime-context payload shape changes so old caches don’t omit `mergedInstructionDocs`.
+    queryKey: ["/api/tenants", tid, "agents", selectedAgent?.id ?? 0, "runtime-context", "v2-merged-docs"],
     queryFn: () =>
       apiRequest("GET", `/api/tenants/${tid}/agents/${selectedAgent!.id}/runtime-context`).then((r) => r.json()),
     enabled: tid > 0 && !!selectedAgent?.id,
-  });
-
-  const { data: skills } = useQuery<{ markdown: string; source: string; updatedAt?: string }>({
-    queryKey: ["/api/agent-definitions", selectedDef?.id ?? 0, "skills", tid],
-    queryFn: () =>
-      apiRequest("GET", `/api/agent-definitions/${selectedDef!.id}/skills?tenantId=${tid}`).then((r) => r.json()),
-    enabled: tid > 0 && !!selectedDef?.id,
+    staleTime: 0,
+    refetchOnMount: "always",
   });
 
   const { data: runs = [] } = useQuery<any[]>({
@@ -318,6 +373,14 @@ export default function MyAgents() {
     onError: () => toast({ title: "Error", description: "Failed to update agent", variant: "destructive" }),
   });
 
+  /** Card avatar emoji (`agents.emoji`) — PATCH so list refetches (agents query uses staleTime: 0). */
+  const patchAgentProfile = useMutation({
+    mutationFn: ({ id, body }: { id: number; body: Record<string, unknown> }) =>
+      apiRequest("PATCH", `/api/agents/${id}`, body).then((r) => r.json()),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["/api/tenants", tid, "agents"] }),
+    onError: () => toast({ title: "Error", description: "Could not update profile emoji", variant: "destructive" }),
+  });
+
   const deleteAgent = useMutation({
     mutationFn: (id: number) => apiRequest("DELETE", `/api/agents/${id}`),
     onSuccess: () => {
@@ -341,6 +404,7 @@ export default function MyAgents() {
       setImportLastScanLabel(null);
       setImportZipDetectedPaths([]);
       setImportBundleExtraText([]);
+      setImportBundleMatchedPaths([]);
       setImportWizardStep(0);
       setImportWizardError(null);
     },
@@ -379,6 +443,7 @@ export default function MyAgents() {
         setImportDocMarkdown((prev) => ({ ...prev, ...docMarkdown }));
         setImportZipDetectedPaths(matchedPaths.length > 0 ? matchedPaths : detected);
         setImportBundleExtraText(extraTextFiles);
+        setImportBundleMatchedPaths(matchedPaths);
         const docKeysNew = Object.keys(docMarkdown);
         const usefulThisScan = hireJson != null || docKeysNew.length > 0 || extraTextFiles.length > 0;
         const zipNoImportable = scannedZipArchives.length > 0 && !usefulThisScan;
@@ -462,6 +527,7 @@ export default function MyAgents() {
         setImportLastScanLabel(null);
         setImportZipDetectedPaths([]);
         setImportBundleExtraText([]);
+        setImportBundleMatchedPaths([]);
         setImportWizardError(
           opts?.fromFolder
             ? `Could not read that folder: ${String((err as Error)?.message ?? err)}. Check permissions or try a smaller selection.`
@@ -613,7 +679,7 @@ export default function MyAgents() {
                     <div className="flex items-center gap-3">
                       <div className="relative">
                         <div className="w-10 h-10 rounded-xl bg-primary/15 flex items-center justify-center text-xl flex-shrink-0">
-                          {def?.emoji ?? "🤖"}
+                          {deployedAgentEmoji(agent, def)}
                         </div>
                         <span className={cn("absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full border-2 border-card", s.dot)} />
                       </div>
@@ -648,9 +714,17 @@ export default function MyAgents() {
                       <p className="text-xs text-muted-foreground">spent</p>
                     </div>
                     <div className="bg-muted/40 rounded-md p-2">
-                      <p className="text-xs font-semibold text-foreground truncate" title={MODEL_LABELS[agent.model] ?? agent.model}>
-                        {agent.model.split("-").pop()}
-                      </p>
+                      {(() => {
+                        const cm = String((agent as { cardModel?: string }).cardModel ?? agent.model ?? "");
+                        const short = cm.includes("/")
+                          ? (cm.split("/").pop()?.split(":")[0] ?? cm)
+                          : (MODEL_LABELS[cm] ?? cm.split("-").pop() ?? cm);
+                        return (
+                          <p className="text-xs font-semibold text-foreground truncate" title={cm}>
+                            {short}
+                          </p>
+                        );
+                      })()}
                       <p className="text-xs text-muted-foreground">model</p>
                     </div>
                   </div>
@@ -728,6 +802,7 @@ export default function MyAgents() {
             setImportLastScanLabel(null);
             setImportZipDetectedPaths([]);
             setImportBundleExtraText([]);
+            setImportBundleMatchedPaths([]);
             setImportWizardStep(0);
             setImportWizardError(null);
           }
@@ -928,16 +1003,104 @@ export default function MyAgents() {
                     </div>
                   </div>
                 </div>
-                <div className="grid gap-2 sm:grid-cols-2">
+                <div className="space-y-2">
                   <div className="space-y-1">
-                    <Label className="text-[10px] text-muted-foreground">Model override (optional)</Label>
+                    <Label className="text-[10px] text-muted-foreground">
+                      {importLlmProvider === "openrouter" ? "OpenRouter model" : "Ollama model"}
+                    </Label>
+                    {importLlmProvider === "openrouter" ? (
+                      <>
+                        <ScrollArea className="h-[min(200px,36vh)] rounded-md border border-border">
+                          <div className="p-2 space-y-1.5 pr-3">
+                            {OPENROUTER_MODELS.map((m) => (
+                              <button
+                                key={m.id}
+                                type="button"
+                                onClick={() => {
+                                  setImportWizardError(null);
+                                  setImportRuntimeModel(m.id);
+                                }}
+                                className={cn(
+                                  "flex w-full items-center justify-between gap-2 rounded-md border px-2 py-1.5 text-left text-xs transition-colors",
+                                  importRuntimeModel.trim() === m.id
+                                    ? "border-primary bg-primary/10"
+                                    : "border-border bg-background/60 hover:bg-muted/50",
+                                )}
+                                data-testid={`import-model-openrouter-${m.id.replace(/[^a-zA-Z0-9_-]/g, "_")}`}
+                              >
+                                <span className="min-w-0">
+                                  <span className="font-medium text-foreground block truncate">{m.label}</span>
+                                  <span className="text-[10px] text-muted-foreground line-clamp-1">{m.desc}</span>
+                                </span>
+                                <span className="flex shrink-0 items-center gap-1.5">
+                                  <span className="text-[10px] font-mono text-muted-foreground">{m.cost}</span>
+                                  {importRuntimeModel.trim() === m.id ? (
+                                    <Check className="h-3.5 w-3.5 text-primary" aria-hidden />
+                                  ) : null}
+                                </span>
+                              </button>
+                            ))}
+                          </div>
+                        </ScrollArea>
+                        <p className="text-[10px] text-muted-foreground leading-snug">
+                          Same curated list as Hire Agent. You can still type any other OpenRouter model id below.
+                        </p>
+                      </>
+                    ) : importOllamaModelsLoading ? (
+                      <p className="text-[10px] text-muted-foreground py-3">Loading models from Ollama…</p>
+                    ) : importOllamaModelsError ? (
+                      <p className="text-[10px] text-destructive leading-snug">
+                        Could not list models. Set Ollama base URL in Settings → Organization, run{" "}
+                        <span className="font-mono">ollama serve</span>, then come back to this step — or type a model
+                        name below.
+                      </p>
+                    ) : (importOllamaModelsRes?.models?.length ?? 0) === 0 ? (
+                      <p className="text-[10px] text-muted-foreground leading-snug">
+                        No models at{" "}
+                        <span className="font-mono text-foreground">{importOllamaModelsRes?.baseUsed ?? "—"}</span>. Pull
+                        one (e.g. <span className="font-mono">ollama pull llama3</span>) or enter a name below.
+                      </p>
+                    ) : (
+                      <ScrollArea className="h-[min(200px,36vh)] rounded-md border border-border">
+                        <div className="p-2 space-y-1.5 pr-3">
+                          {importOllamaModelsRes!.models.map((id) => (
+                            <button
+                              key={id}
+                              type="button"
+                              onClick={() => {
+                                setImportWizardError(null);
+                                setImportRuntimeModel(id);
+                              }}
+                              className={cn(
+                                "flex w-full items-center justify-between gap-2 rounded-md border px-2 py-1.5 text-left text-xs transition-colors",
+                                importRuntimeModel.trim() === id
+                                  ? "border-primary bg-primary/10"
+                                  : "border-border bg-background/60 hover:bg-muted/50",
+                              )}
+                              data-testid={`import-model-ollama-${id.replace(/[^a-zA-Z0-9_-]/g, "_")}`}
+                            >
+                              <span className="font-mono truncate text-foreground" title={id}>
+                                {id}
+                              </span>
+                              {importRuntimeModel.trim() === id ? (
+                                <Check className="h-3.5 w-3.5 shrink-0 text-primary" aria-hidden />
+                              ) : null}
+                            </button>
+                          ))}
+                        </div>
+                      </ScrollArea>
+                    )}
                     <Input
                       value={importRuntimeModel}
                       onChange={(e) => {
                         setImportWizardError(null);
                         setImportRuntimeModel(e.target.value);
                       }}
-                      placeholder="e.g. anthropic/claude-sonnet-4"
+                      placeholder={
+                        importLlmProvider === "openrouter"
+                          ? "e.g. nousresearch/hermes-3-llama-3.1-405b:free"
+                          : "e.g. llama3.2"
+                      }
                       className="h-8 text-xs font-mono"
                       data-testid="import-runtime-model"
                     />
@@ -979,14 +1142,37 @@ export default function MyAgents() {
                         ) : (
                           <>
                             <div className="space-y-1">
+                              <Label className="text-[10px] text-muted-foreground">Profile (emoji)</Label>
+                              <div className="flex items-center gap-2">
+                                <EmojiPicker
+                                  value={
+                                    String(importDraftObject.emoji ?? "").trim() ||
+                                    importReviewDef?.emoji ||
+                                    "🤖"
+                                  }
+                                  onChange={(emoji) => {
+                                    setImportWizardError(null);
+                                    patchImportJson({ emoji });
+                                  }}
+                                  className="w-11 h-9 shrink-0 text-lg"
+                                />
+                                <p className="text-[10px] text-muted-foreground leading-snug flex-1 min-w-0">
+                                  Shown on the agent card avatar only — not appended to the display name.
+                                </p>
+                              </div>
+                            </div>
+                            <div className="space-y-1">
                               <Label htmlFor="import-review-display-name" className="text-[10px] text-muted-foreground">
                                 Display name
                               </Label>
                               <Input
                                 id="import-review-display-name"
                                 value={String(importDraftObject.displayName ?? "")}
-                                onChange={(e) => patchImportJson({ displayName: e.target.value })}
-                                placeholder="e.g. Hermes Support Bot"
+                                onChange={(e) => {
+                                  setImportWizardError(null);
+                                  patchImportJson({ displayName: e.target.value });
+                                }}
+                                placeholder="e.g. Sage"
                                 className="h-8 text-xs"
                                 data-testid="import-review-display-name"
                               />
@@ -1035,6 +1221,15 @@ export default function MyAgents() {
                           </li>
                           <li>
                             LLM: <span className="text-foreground">{importLlmProvider}</span>
+                          </li>
+                          <li>
+                            Profile:{" "}
+                            <span className="text-foreground text-base leading-none" aria-hidden>
+                              {String(importDraftObject.emoji ?? "").trim() || importReviewDef?.emoji || "🤖"}
+                            </span>
+                            <span className="text-muted-foreground">
+                              {String(importDraftObject.emoji ?? "").trim() ? " (override)" : " (from definition)"}
+                            </span>
                           </li>
                           <li>
                             Command: <span className="text-foreground font-mono">{importCommand.trim() || importAdapterDefaultCmd(importAdapterUiId)}</span>
@@ -1098,6 +1293,7 @@ export default function MyAgents() {
                   setImportLastScanLabel(null);
                   setImportZipDetectedPaths([]);
                   setImportBundleExtraText([]);
+                  setImportBundleMatchedPaths([]);
                   setImportWizardStep(0);
                   setImportWizardError(null);
                 }}
@@ -1172,7 +1368,18 @@ export default function MyAgents() {
                     }
                     const baseAgentMd =
                       importDocMarkdown["AGENT.md"] ?? byName.get("AGENT.md")?.markdown ?? "";
-                    const mergedAgentMd = appendImportExtrasToAgentMarkdown(baseAgentMd, importBundleExtraText);
+                    const mdManifest = importBundleMatchedPaths
+                      .filter((p) => {
+                        const lower = p.toLowerCase();
+                        return lower.endsWith(".md") || lower.endsWith(".markdown") || lower.endsWith(".mdx");
+                      })
+                      .slice(0, 600)
+                      .join("\n");
+                    const extrasWithManifest =
+                      mdManifest.trim().length > 0
+                        ? [{ path: "Bundle manifest (.md paths scanned)", text: mdManifest }, ...importBundleExtraText]
+                        : importBundleExtraText;
+                    const mergedAgentMd = appendImportExtrasToAgentMarkdown(baseAgentMd, extrasWithManifest);
                     if (mergedAgentMd.trim()) {
                       byName.set("AGENT.md", { filename: "AGENT.md", markdown: mergedAgentMd });
                     }
@@ -1180,8 +1387,10 @@ export default function MyAgents() {
                     raw.adapterType = importAdapterBackend(importAdapterUiId);
                     raw.llmProvider = importLlmProvider;
                     raw.command = importCommand.trim() || importAdapterDefaultCmd(importAdapterUiId);
-                    const rm = importRuntimeModel.trim();
-                    if (rm) raw.runtimeModel = rm;
+                    const rm = importRuntimeModel.trim() || String(raw.runtimeModel ?? "").trim();
+                    raw.runtimeModel = rm;
+                    const emImp = String(importDraftObject.emoji ?? "").trim();
+                    if (emImp) raw.emoji = emImp;
                     setImportWizardError(null);
                     importAgent.mutate(raw);
                   } catch {
@@ -1198,10 +1407,11 @@ export default function MyAgents() {
       </Dialog>
 
       <Dialog open={detailsAgentId != null} onOpenChange={(o) => setDetailsAgentId(o ? detailsAgentId : null)}>
-        <DialogContent className="max-w-4xl">
+        <DialogContent className="max-w-5xl max-h-[90vh] overflow-hidden flex flex-col">
           <DialogHeader>
             <DialogTitle className="text-sm">
-              {selectedDef?.emoji ?? "🤖"} {selectedAgent?.displayName ?? "Agent"}
+              {selectedAgent ? deployedAgentEmoji(selectedAgent, selectedDef) : "🤖"}{" "}
+              {selectedAgent?.displayName ?? "Agent"}
             </DialogTitle>
             <DialogDescription className="text-xs">
               {selectedAgent?.role ?? "—"}{selectedAgent ? ` · #${selectedAgent.id}` : ""}
@@ -1211,13 +1421,16 @@ export default function MyAgents() {
           {!selectedAgent ? (
             <div className="text-sm text-muted-foreground">Loading…</div>
           ) : (
-            <Tabs defaultValue="dashboard" className="w-full">
-              <TabsList>
-                <TabsTrigger value="dashboard">Dashboard</TabsTrigger>
-                <TabsTrigger value="instructions">Instructions</TabsTrigger>
-                <TabsTrigger value="skills">Skills</TabsTrigger>
-                <TabsTrigger value="run">Run</TabsTrigger>
-              </TabsList>
+            <Tabs defaultValue="dashboard" className="w-full flex-1 min-h-0">
+              <ScrollArea className="w-full">
+                <TabsList className="w-full max-w-full justify-start flex-nowrap overflow-x-auto">
+                  <TabsTrigger value="dashboard" className="shrink-0">Dashboard</TabsTrigger>
+                  <TabsTrigger value="docs" className="shrink-0">Docs</TabsTrigger>
+                  {runtimeCtx?.hasInstanceSkillsFile ? <TabsTrigger value="skills" className="shrink-0">Skills</TabsTrigger> : null}
+                  <TabsTrigger value="run" className="shrink-0">Run</TabsTrigger>
+                </TabsList>
+                <ScrollBar orientation="horizontal" />
+              </ScrollArea>
 
               <TabsContent value="dashboard" className="mt-4 space-y-3">
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
@@ -1242,12 +1455,37 @@ export default function MyAgents() {
                       <div className="text-xs text-muted-foreground flex items-center gap-2">
                         <Cpu className="w-3.5 h-3.5" /> Model
                       </div>
-                      <div className="text-sm font-semibold truncate">
-                        {MODEL_LABELS[selectedAgent.model] ?? selectedAgent.model}
+                      <div
+                        className="text-sm font-semibold truncate"
+                        title={String((selectedAgent as { cardModel?: string }).cardModel ?? selectedAgent.model ?? "")}
+                      >
+                        {(() => {
+                          const cm = String((selectedAgent as { cardModel?: string }).cardModel ?? selectedAgent.model ?? "");
+                          if (MODEL_LABELS[cm]) return MODEL_LABELS[cm];
+                          if (cm.includes("/")) return cm.split("/").pop()?.split(":")[0] ?? cm;
+                          return cm.split("-").pop() ?? cm;
+                        })()}
                       </div>
                     </CardContent>
                   </Card>
                 </div>
+                <Card className="bg-card border-border">
+                  <CardContent className="p-4 flex flex-col sm:flex-row sm:items-center gap-3">
+                    <div className="space-y-1 min-w-0 flex-1">
+                      <div className="text-xs font-medium text-muted-foreground">Card profile emoji</div>
+                      <p className="text-[10px] text-muted-foreground leading-snug">
+                        Saves to this agent only (overrides the library icon on My Agents).
+                      </p>
+                    </div>
+                    <EmojiPicker
+                      value={deployedAgentEmoji(selectedAgent, selectedDef)}
+                      onChange={(emoji) => {
+                        patchAgentProfile.mutate({ id: selectedAgent.id, body: { emoji } });
+                      }}
+                      className="w-11 h-9 shrink-0 text-lg"
+                    />
+                  </CardContent>
+                </Card>
                 <div className="text-xs text-muted-foreground flex items-center gap-2">
                   <Clock className="w-3.5 h-3.5" />
                   <span>
@@ -1260,35 +1498,152 @@ export default function MyAgents() {
                 </div>
               </TabsContent>
 
-              <TabsContent value="instructions" className="mt-4 space-y-3">
-                <Card className="bg-card border-border">
-                  <CardContent className="p-4 space-y-2">
-                    <div className="text-xs text-muted-foreground">Goal</div>
-                    <div className="text-sm">{selectedAgent.goal ?? "—"}</div>
-                  </CardContent>
-                </Card>
-                <Card className="bg-card border-border">
-                  <CardContent className="p-4 space-y-2">
-                    <div className="text-xs text-muted-foreground">System prompt (preview)</div>
-                    <pre className="text-xs whitespace-pre-wrap bg-muted/30 border border-border rounded-md p-3 max-h-[320px] overflow-auto">
-{runtimeCtx?.systemPrompt ?? "—"}
-                    </pre>
-                  </CardContent>
-                </Card>
+              <TabsContent value="docs" className="mt-4 space-y-3 flex-1 min-h-0">
+                {!runtimeCtx?.mergedInstructionDocs ? (
+                  <p className="text-xs text-muted-foreground border border-dashed border-border rounded-md p-3">
+                    Loading docs… if this stays empty, refresh once.
+                  </p>
+                ) : (
+                  (() => {
+                    const merged = runtimeCtx.mergedInstructionDocs as Record<
+                      string,
+                      { markdown?: string; source?: string }
+                    >;
+                    const agentMd = String(merged?.AGENT?.markdown ?? "");
+                    const importedEntries = parseImportedBundleEntries(agentMd);
+                    const manifestPaths = extractImportedBundlePaths(agentMd);
+
+                    const canon = DEPLOYED_INSTRUCTION_DOC_KEYS.map((key) => {
+                      const row = merged[key];
+                      return {
+                        id: `canon:${key}`,
+                        title: `${key}.md`,
+                        markdown: String(row?.markdown ?? ""),
+                        source: row?.source,
+                      };
+                    }).filter((d) => d.markdown.trim().length > 0);
+
+                    const imported = importedEntries
+                      .filter((e) => e.path !== "Bundle manifest (.md paths scanned)")
+                      .map((e) => ({
+                        id: `import:${e.path}`,
+                        title: e.path,
+                        markdown: e.markdown,
+                        source: "import",
+                      }));
+
+                    const all = [...canon, ...imported];
+                    const defaultDoc = all[0]?.id ?? "canon:AGENT";
+
+                    return (
+                      <div className="space-y-3">
+                        {manifestPaths.length ? (
+                          <div className="rounded-md border border-border bg-muted/10 px-3 py-2">
+                            <div className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide">
+                              Import manifest
+                            </div>
+                            <p className="text-[10px] text-muted-foreground leading-snug mt-1">
+                              {manifestPaths.length} markdown file(s) detected in your zip · showing{" "}
+                              <span className="font-medium text-foreground">{canon.length + imported.length}</span> doc tab(s)
+                            </p>
+                          </div>
+                        ) : null}
+
+                        <Tabs defaultValue={defaultDoc} className="w-full flex-1 min-h-0">
+                          <ScrollArea className="w-full">
+                            <TabsList className="w-full max-w-full justify-start flex-nowrap overflow-x-auto">
+                              {canon.map((d) => (
+                                <TabsTrigger key={d.id} value={d.id} className="text-xs shrink-0">
+                                  {d.title}
+                                </TabsTrigger>
+                              ))}
+                              {imported.map((d) => (
+                                <TabsTrigger
+                                  key={d.id}
+                                  value={d.id}
+                                  className="text-xs shrink-0"
+                                  title={d.title}
+                                >
+                                  {d.title.split("/").slice(-1)[0]}
+                                </TabsTrigger>
+                              ))}
+                            </TabsList>
+                            <ScrollBar orientation="horizontal" />
+                          </ScrollArea>
+
+                          {all.map((d) => (
+                            <TabsContent key={d.id} value={d.id} className="mt-3 flex-1 min-h-0">
+                              <Card className="bg-card border-border">
+                                <CardContent className="p-3 space-y-2">
+                                  <div className="flex items-baseline justify-between gap-2 flex-wrap">
+                                    <span className="text-xs font-semibold text-foreground">{d.title}</span>
+                                    <span className="text-[10px] text-muted-foreground">source: {d.source ?? "—"}</span>
+                                  </div>
+                                  <pre className="text-xs whitespace-pre-wrap bg-muted/30 border border-border rounded-md p-3 max-h-[min(560px,55vh)] overflow-auto">
+                                    {d.markdown.trim() ? d.markdown : "—"}
+                                  </pre>
+                                </CardContent>
+                              </Card>
+                            </TabsContent>
+                          ))}
+                        </Tabs>
+                      </div>
+                    );
+                  })()
+                )}
               </TabsContent>
 
+              {runtimeCtx?.hasInstanceSkillsFile ? (
               <TabsContent value="skills" className="mt-4 space-y-3">
-                <Card className="bg-card border-border">
-                  <CardContent className="p-4 space-y-2">
-                    <div className="text-xs text-muted-foreground">
-                      skills.md (source: {skills?.source ?? "—"})
+                {(() => {
+                  const agentMd = String(
+                    (runtimeCtx?.mergedInstructionDocs as Record<string, { markdown?: string }> | undefined)?.AGENT
+                      ?.markdown ?? "",
+                  );
+                  const fromZip = extractImportedBundleSection(agentMd);
+                  const skillsRow = runtimeCtx?.skills as { markdown?: string; source?: string } | undefined;
+                  return (
+                    <div className="space-y-3">
+                      {fromZip ? (
+                        <Card className="bg-card border-border border-primary/25">
+                          <CardContent className="p-4 space-y-2">
+                            <div className="text-xs font-semibold text-foreground">From your uploaded zip / folder</div>
+                            <p className="text-[10px] text-muted-foreground leading-snug">
+                              Stored inside <span className="font-mono">AGENT.md</span> under{" "}
+                              <span className="font-mono">Imported bundle (extra files)</span> so Cortex can use paths that are not
+                              named <span className="font-mono">SKILLS.md</span>.
+                            </p>
+                            <pre className="text-xs whitespace-pre-wrap bg-muted/30 border border-border rounded-md p-3 max-h-[min(480px,50vh)] overflow-auto">
+                              {fromZip}
+                            </pre>
+                          </CardContent>
+                        </Card>
+                      ) : (
+                        <p className="text-[11px] text-muted-foreground border border-dashed border-border rounded-md p-3">
+                          No <span className="font-mono">Imported bundle</span> block in <span className="font-mono">AGENT.md</span> —
+                          open <span className="font-mono">AGENT.md</span> under Instructions for the full file, or re-import a zip
+                          that includes extra <span className="font-mono">.md</span> / text files (they are merged into{" "}
+                          <span className="font-mono">AGENT.md</span>).
+                        </p>
+                      )}
+                      <Card className="bg-card border-border">
+                        <CardContent className="p-4 space-y-2">
+                          <div className="text-xs font-semibold text-foreground">SKILLS.md (role / library)</div>
+                          <p className="text-[10px] text-muted-foreground leading-snug">
+                            Effective skills for runs (library template when your zip did not ship a dedicated{" "}
+                            <span className="font-mono">SKILLS.md</span>). Source:{" "}
+                            <span className="font-mono">{skillsRow?.source ?? "—"}</span>
+                          </p>
+                          <pre className="text-xs whitespace-pre-wrap bg-muted/30 border border-border rounded-md p-3 max-h-[280px] overflow-auto">
+                            {skillsRow?.markdown ?? "—"}
+                          </pre>
+                        </CardContent>
+                      </Card>
                     </div>
-                    <pre className="text-xs whitespace-pre-wrap bg-muted/30 border border-border rounded-md p-3 max-h-[420px] overflow-auto">
-{skills?.markdown ?? "—"}
-                    </pre>
-                  </CardContent>
-                </Card>
+                  );
+                })()}
               </TabsContent>
+              ) : null}
 
               <TabsContent value="run" className="mt-4 space-y-3">
                 <div className="flex items-center justify-between gap-3 flex-wrap">

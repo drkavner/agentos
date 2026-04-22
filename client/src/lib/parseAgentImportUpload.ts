@@ -90,15 +90,73 @@ const MAX_ZIP_AUX_TEXT_ENTRIES = 500;
 export type ImportBundleExtraText = { path: string; text: string };
 
 /** Appends zip/folder “extra” text into AGENT.md so Cortex/Hermes see the full bundle (server only persists canonical filenames). */
+/** Marker appended by `appendImportExtrasToAgentMarkdown` — UI can split “your zip” vs base AGENT. */
+export const IMPORTED_BUNDLE_SECTION_MARKER = "## Imported bundle (extra files)";
+
 export function appendImportExtrasToAgentMarkdown(
   baseAgentMarkdown: string,
   extras: ImportBundleExtraText[],
 ): string {
   if (!extras.length) return baseAgentMarkdown;
   const parts = extras.map(({ path, text }) => `### ${path}\n\n${text.trim()}`);
-  const section = `\n\n---\n\n## Imported bundle (extra files)\n\n${parts.join("\n\n---\n\n")}\n`;
+  const section = `\n\n---\n\n${IMPORTED_BUNDLE_SECTION_MARKER}\n\n${parts.join("\n\n---\n\n")}\n`;
   const base = baseAgentMarkdown.trim();
   return (base ? `${base}${section}` : section.trim()).trim();
+}
+
+/** Returns markdown from the zip-bundle section inside merged AGENT.md, or null if none. */
+export function extractImportedBundleSection(agentMd: string): string | null {
+  if (!agentMd) return null;
+  const i = agentMd.indexOf(IMPORTED_BUNDLE_SECTION_MARKER);
+  if (i < 0) return null;
+  return agentMd.slice(i).trim();
+}
+
+/** Extract `### <path>` headings from the imported bundle section (manifest for UI). */
+export function extractImportedBundlePaths(agentMd: string): string[] {
+  const section = extractImportedBundleSection(agentMd);
+  if (!section) return [];
+  const paths: string[] = [];
+  for (const line of section.split("\n")) {
+    const m = /^###\s+(.+?)\s*$/.exec(line);
+    if (!m) continue;
+    const p = m[1]?.trim();
+    if (p) paths.push(p);
+  }
+  return Array.from(new Set(paths));
+}
+
+export type ImportedBundleEntry = { path: string; markdown: string };
+
+/** Parse the imported bundle section into entries (each `### path` + body). */
+export function parseImportedBundleEntries(agentMd: string): ImportedBundleEntry[] {
+  const section = extractImportedBundleSection(agentMd);
+  if (!section) return [];
+  const lines = section.split("\n");
+  const entries: ImportedBundleEntry[] = [];
+  let currentPath: string | null = null;
+  let buf: string[] = [];
+
+  function flush() {
+    if (!currentPath) return;
+    const md = buf.join("\n").trim();
+    entries.push({ path: currentPath, markdown: md });
+  }
+
+  for (const line of lines) {
+    const m = /^###\s+(.+?)\s*$/.exec(line);
+    if (m) {
+      flush();
+      currentPath = m[1]?.trim() ?? "";
+      buf = [];
+      continue;
+    }
+    // Skip separator lines between entries.
+    if (/^---\s*$/.test(line)) continue;
+    buf.push(line);
+  }
+  flush();
+  return entries.filter((e) => e.path && e.markdown);
 }
 
 function isAuxBundleTextLeaf(leaf: string): boolean {

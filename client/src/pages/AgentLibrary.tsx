@@ -10,7 +10,7 @@ import { Search, Plus, Filter, Rocket } from "lucide-react";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter,
 } from "@/components/ui/dialog";
-import { cn } from "@/lib/utils";
+import { cn, deployedAgentEmoji } from "@/lib/utils";
 import { HireAgentWizard } from "@/components/HireAgentWizard";
 import { useTenantContext } from "@/tenant/TenantContext";
 import { Textarea } from "@/components/ui/textarea";
@@ -211,7 +211,7 @@ export default function AgentLibrary() {
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
           {filteredDeployed.map((a) => {
             const def = defById.get(a.definitionId);
-            const emoji = def?.emoji ?? "🤖";
+            const emoji = deployedAgentEmoji(a, def);
             const color = def?.color ?? "#64748b";
             const divisionLabel = def?.division ?? "Deployed";
             return (

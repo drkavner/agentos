@@ -39,13 +39,15 @@ export async function materializeDefaultAgentInstanceDocs(tenantId: number, agen
   await fs.promises.mkdir(dir, { recursive: true });
   const base = await getAgentDocs(definitionId);
   if (!base) return;
-  const skillsEff = await getEffectiveDefinitionSkills(tenantId, definitionId);
   for (const docType of AGENT_DOC_TYPES) {
+    // SKILLS is merged at read time from org overrides / definition unless the agent has an on-disk
+    // SKILLS.md (import overlay or manual). Avoid writing a template SKILLS.md that masks uploads.
+    if (docType === "SKILLS") continue;
     const p = instanceDocPath(tenantId, agentId, docType);
     try {
       await fs.promises.access(p);
     } catch {
-      const content = docType === "SKILLS" ? skillsEff.markdown : base[docType].markdown;
+      const content = base[docType].markdown;
       await fs.promises.writeFile(p, content, "utf-8");
     }
   }
@@ -69,6 +71,15 @@ export function agentInstanceHasSkillsFile(tenantId: number, agentId: number): b
     return fs.existsSync(instanceDocPath(tenantId, agentId, "SKILLS"));
   } catch {
     return false;
+  }
+}
+
+export async function removeAgentInstanceSkillsFile(tenantId: number, agentId: number) {
+  const p = instanceDocPath(tenantId, agentId, "SKILLS");
+  try {
+    await fs.promises.unlink(p);
+  } catch {
+    // ignore missing / permission errors (best-effort cleanup)
   }
 }
 

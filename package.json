@@ -9,6 +9,7 @@
     "build": "tsx script/build.ts",
     "start": "NODE_ENV=production node dist/index.cjs",
     "check": "tsc",
+    "verify:agent-import": "tsx script/verify-agent-import.ts",
     "skills:generate": "tsx script/generate-agent-definition-skills.ts",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx script/db-migrate.ts",

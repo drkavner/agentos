@@ -62,10 +62,13 @@ import { maybeDelegateCeoIncomingTask, maybeAutoCloseParentCeoTask } from "./ceo
 import {
   getMergedAgentDocsForDeployed,
   materializeDefaultAgentInstanceDocs,
+  agentInstanceHasSkillsFile,
+  removeAgentInstanceSkillsFile,
   parseAgentDocFilesFromBody,
   stripAgentDocFilesFromBody,
   writeAgentInstanceDocOverlays,
 } from "./agentInstanceDocs";
+import { normalizeAgentImportPayload, resolveDefinitionIdForImport } from "./agentImport";
 
 // dispatchAgentRun imported from ./dispatchAgentRun
 
@@ -112,59 +115,6 @@ function zodDetails(error: unknown) {
   return error;
 }
 
-/** Normalize JSON from "Import agent" (flat hire body, or bundle like GET /agents/:id/docs + nested agent/runtime). */
-function normalizeAgentImportPayload(raw: unknown): Record<string, unknown> {
-  if (raw == null || typeof raw !== "object") {
-    throw new ApiError(400, "validation_error", "Import payload must be a JSON object");
-  }
-  const r = raw as Record<string, unknown>;
-  const wrapped = (r as any).import != null ? (r as any).import : raw;
-  if (wrapped == null || typeof wrapped !== "object") {
-    throw new ApiError(400, "validation_error", "Import payload must be a JSON object");
-  }
-  const w = wrapped as any;
-  let base: Record<string, unknown>;
-  if (w.agent && typeof w.agent === "object") {
-    base = { ...(w.agent as Record<string, unknown>) };
-    if (w.definition && typeof w.definition === "object") {
-      const d = w.definition as Record<string, unknown>;
-      if (base.definitionId == null && d.id != null) base.definitionId = d.id;
-      if (base.definitionName == null && d.name != null) base.definitionName = d.name;
-    }
-    if (w.runtime && typeof w.runtime === "object") {
-      Object.assign(base, w.runtime as Record<string, unknown>);
-    }
-  } else {
-    base = { ...(wrapped as Record<string, unknown>) };
-  }
-  delete base.id;
-  delete (base as any).tenantId;
-  delete (base as any).tasksCompleted;
-  delete (base as any).spentThisMonth;
-  delete (base as any).lastHeartbeat;
-  delete (base as any).tenant;
-  delete (base as any).definition;
-  return base;
-}
-
-function resolveDefinitionIdForImport(body: Record<string, unknown>): number {
-  const id = Number(body.definitionId);
-  if (Number.isFinite(id) && id > 0) {
-    const def = storage.getAgentDefinition(id);
-    if (def) return id;
-  }
-  const name = String(body.definitionName ?? "").trim().toLowerCase();
-  if (!name) {
-    throw new ApiError(400, "validation_error", "Provide definitionId or definitionName to import an agent");
-  }
-  const defs = storage.getAgentDefinitions();
-  const hit = defs.find((d) => String(d.name).trim().toLowerCase() === name);
-  if (!hit) {
-    throw new ApiError(400, "validation_error", `Unknown definitionName "${String(body.definitionName)}"`);
-  }
-  return hit.id;
-}
-
 async function hireAgentForTenantInternal(
   tenantId: number,
   reqBody: Record<string, unknown>,
@@ -183,6 +133,7 @@ async function hireAgentForTenantInternal(
   }
   const hireBody: Record<string, unknown> = { ...reqBody, tenantId };
   const docFileOverlays = parseAgentDocFilesFromBody(hireBody);
+  const importedSkillsFile = docFileOverlays.some((f) => f.filename === "SKILLS.md");
   stripAgentDocFilesFromBody(hireBody);
   if (hireBody.managerId != null) {
     const mid = Number(hireBody.managerId);
@@ -197,6 +148,11 @@ async function hireAgentForTenantInternal(
   delete hireBody.command;
   const rawModel = String(hireBody.runtimeModel ?? "").trim();
   delete hireBody.runtimeModel;
+  const rawEmoji =
+    hireBody.emoji != null && String(hireBody.emoji).trim() !== ""
+      ? String(hireBody.emoji).trim().slice(0, 32)
+      : "";
+  delete hireBody.emoji;
   const rawThinkingEffort = String(hireBody.thinkingEffort ?? "auto");
   delete hireBody.thinkingEffort;
   const rawExtraArgs = String(hireBody.extraArgs ?? "");
@@ -214,19 +170,32 @@ async function hireAgentForTenantInternal(
     if (ceo) parsed.data.managerId = ceo.id;
   }
 
-  const agent = storage.createAgent(parsed.data);
+  const agentRow = {
+    ...parsed.data,
+    ...(rawModel ? { model: rawModel } : {}),
+    ...(rawEmoji ? { emoji: rawEmoji } : {}),
+  };
+  const agent = storage.createAgent(agentRow);
   ensureAgentConfigurationTables();
 
   const adapterType = (["hermes", "openclaw", "cli"].includes(rawAdapterType) ? rawAdapterType : "hermes") as any;
+  const runtimeModelStored = rawModel.trim() || String(parsed.data.model ?? "").trim();
   upsertAgentRuntimeSettings(agent.id, {
     llmProvider,
     adapterType,
     command: rawCommand,
-    model: rawModel,
+    model: runtimeModelStored,
     thinkingEffort: (["auto", "low", "medium", "high"].includes(rawThinkingEffort) ? rawThinkingEffort : "auto") as any,
     extraArgs: rawExtraArgs,
     heartbeatEnabled: rawHeartbeatEnabled,
   });
+  // Keep agents row in sync for list cards (some DB drivers / older inserts only had runtime model).
+  const agentVisualPatch: Record<string, string> = {};
+  if (runtimeModelStored) agentVisualPatch.model = runtimeModelStored;
+  if (rawEmoji) agentVisualPatch.emoji = rawEmoji;
+  if (Object.keys(agentVisualPatch).length > 0) {
+    storage.updateAgent(agent.id, agentVisualPatch as any);
+  }
   auditAndInvalidate(tenantId, ["agents"], {
     agentId: agent.id,
     agentName: agent.displayName,
@@ -237,9 +206,13 @@ async function hireAgentForTenantInternal(
     tokensUsed: 0,
     cost: 0,
   });
-  await materializeDefaultAgentInstanceDocs(tenantId, agent.id, agent.definitionId);
   if (docFileOverlays.length) {
     await writeAgentInstanceDocOverlays(tenantId, agent.id, docFileOverlays);
+  }
+  await materializeDefaultAgentInstanceDocs(tenantId, agent.id, agent.definitionId);
+  if (!importedSkillsFile) {
+    // Keep Skills derived from library/overrides unless the import explicitly shipped SKILLS.md.
+    await removeAgentInstanceSkillsFile(tenantId, agent.id);
   }
   if (String(agent.status) === "running") {
     void (async () => {
@@ -250,7 +223,7 @@ async function hireAgentForTenantInternal(
       }
     })();
   }
-  return agent;
+  return storage.getAgent(agent.id) ?? agent;
 }
 
 export async function registerRoutes(httpServer: Server, app: Express) {
@@ -830,16 +803,37 @@ export async function registerRoutes(httpServer: Server, app: Express) {
     const def = storage.getAgentDefinition(agent.definitionId);
     if (!def) throw new ApiError(404, "not_found", "Agent definition not found");
 
-    const skills = await getEffectiveDefinitionSkills(tenantId, def.id);
+    const definitionSkills = await getEffectiveDefinitionSkills(tenantId, def.id);
     ensureAgentConfigurationTables();
     const runtime = getAgentRuntimeSettings(agentId);
     const systemPrompt = await buildAgentSystemPrompt(tenantId, agentId);
+    let mergedInstructionDocs = await getMergedAgentDocsForDeployed(tenantId, agentId, def.id);
+    let hasInstanceSkillsFile = agentInstanceHasSkillsFile(tenantId, agentId);
+
+    // Self-heal legacy imports: some agents have an on-disk SKILLS.md that is just the library template.
+    // If the instance SKILLS matches the effective definition skills exactly, treat it as "not imported"
+    // and remove it so the UI doesn't imply the zip shipped SKILLS.md.
+    const instanceSkillsMd = mergedInstructionDocs?.SKILLS?.markdown?.trim() ?? "";
+    const effectiveSkillsMd = definitionSkills.markdown.trim();
+    if (hasInstanceSkillsFile && instanceSkillsMd && instanceSkillsMd === effectiveSkillsMd) {
+      await removeAgentInstanceSkillsFile(tenantId, agentId);
+      hasInstanceSkillsFile = false;
+      mergedInstructionDocs = await getMergedAgentDocsForDeployed(tenantId, agentId, def.id);
+    }
+
+    const skills = {
+      markdown: mergedInstructionDocs?.SKILLS?.markdown ?? definitionSkills.markdown,
+      source: mergedInstructionDocs?.SKILLS?.source ?? definitionSkills.source,
+      ...(definitionSkills.updatedAt ? { updatedAt: definitionSkills.updatedAt } : {}),
+    };
 
     res.json({
       tenant: { id: tenant.id, name: tenant.name, adapterType: tenant.adapterType },
       agent,
       definition: def,
       skills,
+      mergedInstructionDocs,
+      hasInstanceSkillsFile,
       runtime,
       systemPrompt,
     });
@@ -870,9 +864,17 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   // ─── Agents ───────────────────────────────────────────────────────────────
-  app.get("/api/tenants/:tenantId/agents", (req, res) =>
-    res.json(storage.getAgents(Number(req.params.tenantId)))
-  );
+  app.get("/api/tenants/:tenantId/agents", (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    ensureAgentConfigurationTables();
+    const list = storage.getAgents(tenantId);
+    const out = list.map((a) => {
+      const rt = getAgentRuntimeSettings(a.id);
+      const rm = String(rt.model ?? "").trim();
+      return { ...a, cardModel: rm || a.model };
+    });
+    res.json(out);
+  });
   app.post("/api/tenants/:tenantId/agents", async (req, res) => {
     const tenantId = Number(req.params.tenantId);
     const agent = await hireAgentForTenantInternal(tenantId, { ...(req.body as object) });
@@ -918,6 +920,10 @@ export async function registerRoutes(httpServer: Server, app: Express) {
     if (body.profile) upsertAgentProfile(agentId, body.profile);
     if (body.runtime) {
       upsertAgentRuntimeSettings(agentId, body.runtime);
+      const rmCfg = String(body.runtime.model ?? "").trim();
+      if (rmCfg) {
+        storage.updateAgent(agentId, { model: rmCfg } as any);
+      }
 
       // Make heartbeat controls "real": sync to agent status + cron schedule
       if (body.runtime.heartbeatEverySec !== undefined) {

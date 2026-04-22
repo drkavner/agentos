@@ -1,8 +1,20 @@
 import { clsx, type ClassValue } from "clsx"
 import { twMerge } from "tailwind-merge"
+import type { Agent, AgentDefinition } from "@shared/schema"
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
+}
+
+/** Card / tree avatar: per-agent override, else library definition emoji. */
+export function deployedAgentEmoji(
+  agent: Pick<Agent, "emoji">,
+  def: Pick<AgentDefinition, "emoji"> | null | undefined,
+): string {
+  const o = String(agent.emoji ?? "").trim();
+  if (o) return o;
+  const d = String(def?.emoji ?? "").trim();
+  return d || "🤖";
 }
 
 export function formatDistanceToNow(dateStr: string): string {

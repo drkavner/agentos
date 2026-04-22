@@ -96,6 +96,8 @@ export const agents = sqliteTable("agents", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   tenantId: integer("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
   definitionId: integer("definition_id").notNull().references(() => agentDefinitions.id, { onDelete: "restrict" }),
+  /** Optional override for cards / org chart; falls back to agent_definitions.emoji when null. */
+  emoji: text("emoji"),
   displayName: text("display_name").notNull(),
   role: text("role").notNull(), // e.g. "CEO", "Head of Growth"
   model: text("model").notNull().default("claude-3-5-sonnet"),

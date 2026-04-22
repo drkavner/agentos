@@ -10,5 +10,10 @@ export const OPENROUTER_MODELS: OpenRouterModelDef[] = [
   { id: "google/gemini-2.5-pro", label: "Gemini 2.5 Pro", desc: "Google's best", cost: "~$0.007/1k tokens" },
   { id: "google/gemini-2.5-flash", label: "Gemini 2.5 Flash", desc: "Google, very fast", cost: "~$0.0001/1k tokens" },
   { id: "meta-llama/llama-4-maverick", label: "Llama 4 Maverick", desc: "Meta open-source", cost: "~$0.0002/1k tokens" },
-  { id: "deepseek/deepseek-chat-v3-0324:free", label: "DeepSeek V3 (Free)", desc: "Free tier", cost: "Free" },
+  {
+    id: "nousresearch/hermes-3-llama-3.1-405b:free",
+    label: "Hermes 3 Llama 3.1 405B (Free)",
+    desc: "Nous Research · OpenRouter free tier",
+    cost: "Free",
+  },
 ];

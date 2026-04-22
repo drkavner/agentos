@@ -19,7 +19,7 @@ import {
   DialogDescription,
 } from "@/components/ui/dialog";
 import { Network, Users, Plus, ZoomIn, ZoomOut, RotateCcw, LayoutGrid, GitBranch } from "lucide-react";
-import { cn } from "@/lib/utils";
+import { cn, deployedAgentEmoji } from "@/lib/utils";
 import { useToast } from "@/hooks/use-toast";
 
 const STATUS_COLORS: Record<string, string> = {
@@ -117,7 +117,7 @@ function AgentNode({ agent, allAgents, defs, level }: AgentNodeProps) {
       >
         <div className="relative inline-block mb-1.5">
           <div className={cn("bg-primary/10 flex items-center justify-center mx-auto", s.avatar, s.avatarText)}>
-            {def?.emoji ?? "🤖"}
+            {deployedAgentEmoji(agent, def)}
           </div>
           <span className={cn("absolute -bottom-0.5 -right-0.5 rounded-full border-2 border-card", s.dot, STATUS_DOT[agent.status] ?? "bg-muted")} />
         </div>
@@ -538,7 +538,7 @@ export default function OrgChart() {
                         >
                           <div className="relative inline-block mb-1.5 pointer-events-none">
                             <div className="w-10 h-10 rounded-lg bg-primary/10 flex items-center justify-center text-xl mx-auto">
-                              {def?.emoji ?? "🤖"}
+                              {deployedAgentEmoji(agent, def)}
                             </div>
                             <span
                               className={cn(
@@ -603,7 +603,7 @@ export default function OrgChart() {
                   <div className="flex -space-x-2">
                     {agents.slice(0, 5).map(a => (
                       <div key={a.id} className="w-7 h-7 rounded-full bg-primary/10 border-2 border-card flex items-center justify-center text-sm" title={a.displayName}>
-                        {defs.find(d => d.id === a.definitionId)?.emoji ?? "🤖"}
+                        {deployedAgentEmoji(a, defs.find(d => d.id === a.definitionId))}
                       </div>
                     ))}
                   </div>
