@@ -7,9 +7,12 @@ import { storage } from "./storage";
 import { auditAndInvalidate } from "./realtimeSideEffects";
 import { createAgentRun, addRunEvent, finishAgentRun } from "./agentRuns";
 import { pickAgentPrimaryChannel } from "./hermesAdapter";
+import { getMergedAgentDocsForDeployed } from "./agentInstanceDocs";
 
 const collabThrottle = new Map<string, number>();
 const COLLAB_COOLDOWN_MS = 12_000;
+
+const MAX_SKILLS_SNAPSHOT_CHARS = 12_000;
 
 export type OpenclawRunOk = {
   ok: true;
@@ -48,6 +51,16 @@ export async function openclawRunOnce(
       forceChannelType: _opts.forceChannelType,
       discussionContext: _opts.discussionContext,
     });
+    if (!r || (r as { ok?: boolean }).ok !== true) {
+      const bad = r as { error?: string; reason?: string } | null | undefined;
+      return {
+        ok: false as const,
+        error:
+          typeof bad?.error === "string" && bad.error.trim()
+            ? bad.error.trim()
+            : String(bad?.reason ?? "hermes_run_failed"),
+      };
+    }
     return {
       ok: true as const,
       tokensUsed: (r as any).tokensUsed ?? 0,
@@ -62,16 +75,37 @@ export async function openclawRunOnce(
   addRunEvent(run.id, {
     kind: "event",
     message:
-      "OpenClaw: run registered in Cortex. Heavy execution is performed by your OpenClaw gateway; this app records runs and collaboration for visibility.",
+      "OpenClaw adapter: this run is recorded in Cortex only (no in-app LLM). Use Hermes for a real model loop here, or have your gateway call GET …/agents/:id/runtime-context for merged prompts and SKILLS.",
   });
 
   const def = storage.getAgentDefinition(agent.definitionId);
+  if (def) {
+    try {
+      const merged = await getMergedAgentDocsForDeployed(tenantId, agentId, def.id);
+      const md = String(merged?.SKILLS?.markdown ?? "").trim();
+      if (md.length > 0) {
+        const snap = md.length > MAX_SKILLS_SNAPSHOT_CHARS ? `${md.slice(0, MAX_SKILLS_SNAPSHOT_CHARS)}\n\n… [truncated]` : md;
+        addRunEvent(run.id, {
+          kind: "stdout",
+          message: `Merged SKILLS for this agent at run time (${md.length} chars):\n${snap}`,
+        });
+      } else {
+        addRunEvent(run.id, { kind: "event", message: "Merged SKILLS markdown is empty for this agent." });
+      }
+    } catch (err) {
+      addRunEvent(run.id, {
+        kind: "stderr",
+        message: `Could not load merged agent docs: ${String((err as Error)?.message ?? err)}`,
+      });
+    }
+  }
+
   const channelId = _opts?.forceChannelId ?? pickAgentPrimaryChannel(tenantId, agentId, null).channelId;
   const channelType = _opts?.forceChannelType ?? (channelId.startsWith("team-") ? "team" : channelId.startsWith("dm-") ? "dm" : "general");
   const body = [
-    `[OpenClaw] Manual run from Cortex — prompts/skills for this agent are loaded here.`,
-    `Hook your OpenClaw gateway to automate real work; this message confirms the run signal was saved (run #${run.id}).`,
-  ].join(" ");
+    `[OpenClaw] Manual run #${run.id} saved in Cortex.`,
+    `No LLM or gateway call is made from this button. Open this agent’s Run tab → run #${run.id} for the merged SKILLS snapshot stored on the run.`,
+  ].join("\n");
 
   const posted = storage.createMessage({
     tenantId,
@@ -98,7 +132,11 @@ export async function openclawRunOnce(
     cost: 0,
   });
 
-  finishAgentRun(run.id, { status: "ok", summary: "OpenClaw run recorded in Cortex", error: null });
+  finishAgentRun(run.id, {
+    status: "ok",
+    summary: `OpenClaw: run #${run.id} logged in Cortex (no in-app LLM; merged SKILLS attached to run events)`,
+    error: null,
+  });
 
   storage.updateAgent(agentId, { lastHeartbeat: new Date().toISOString() });
   auditAndInvalidate(tenantId, ["agents"], {

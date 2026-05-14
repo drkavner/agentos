@@ -441,8 +441,16 @@ export async function hermesRunOnce(
             tokensUsed: 0,
             cost: 0,
           });
-          finishAgentRun(run.id, { status: "failed", error: "llm", summary: "Hermes Agent CLI failed" });
-          return { ok: false as const, reason: "llm_error" as const };
+          finishAgentRun(run.id, {
+            status: "failed",
+            error: String(hermes.error ?? "").trim().slice(0, 2000) || "llm",
+            summary: "Hermes Agent CLI failed",
+          });
+          return {
+            ok: false as const,
+            reason: "llm_error" as const,
+            error: String(hermes.error ?? "").trim().slice(0, 2000) || undefined,
+          };
         }
         assistantBody = hermes.text;
         llmMode = "live";
@@ -474,8 +482,17 @@ export async function hermesRunOnce(
             tokensUsed: 0,
             cost: 0,
           });
-          finishAgentRun(run.id, { status: "failed", error: "llm", summary: "LLM request failed" });
-          return { ok: false as const, reason: "llm_error" as const };
+          const llmErr = String(llm.error ?? "").trim().slice(0, 1800);
+          finishAgentRun(run.id, {
+            status: "failed",
+            error: llmErr ? `${routing}/${modelId}: ${llmErr}` : "llm",
+            summary: "LLM request failed",
+          });
+          return {
+            ok: false as const,
+            reason: "llm_error" as const,
+            error: llmErr ? `${routing}/${modelId}: ${llmErr}` : undefined,
+          };
         }
         assistantBody = llm.text;
         tokensUsed = Math.max(1, llm.promptTokens + llm.completionTokens);

@@ -19,13 +19,14 @@ import {
   DialogDescription,
 } from "@/components/ui/dialog";
 import { Network, Users, Plus, ZoomIn, ZoomOut, RotateCcw, LayoutGrid, GitBranch } from "lucide-react";
-import { cn, deployedAgentEmoji } from "@/lib/utils";
+import { cn, deployedAgentEmoji, agentCardStatus } from "@/lib/utils";
 import { useToast } from "@/hooks/use-toast";
 
 const STATUS_COLORS: Record<string, string> = {
   running: "border-green-500/60 bg-green-500/5",
   idle: "border-yellow-500/40 bg-yellow-500/5",
   paused: "border-orange-500/40 bg-orange-500/5",
+  error: "border-destructive/50 bg-destructive/5",
   terminated: "border-red-500/40 bg-red-500/5",
 };
 
@@ -33,6 +34,7 @@ const STATUS_DOT: Record<string, string> = {
   running: "bg-green-500 status-running",
   idle: "bg-yellow-500",
   paused: "bg-orange-500",
+  error: "bg-destructive",
   terminated: "bg-red-500",
 };
 
@@ -111,7 +113,7 @@ function AgentNode({ agent, allAgents, defs, level }: AgentNodeProps) {
         className={cn(
           "relative border rounded-xl text-center cursor-pointer hover:border-primary/60 transition-all",
           s.card, s.pad,
-          STATUS_COLORS[agent.status] ?? "border-border bg-card",
+          STATUS_COLORS[agentCardStatus(agent)] ?? "border-border bg-card",
         )}
         data-testid={`org-node-${agent.id}`}
       >
@@ -119,7 +121,7 @@ function AgentNode({ agent, allAgents, defs, level }: AgentNodeProps) {
           <div className={cn("bg-primary/10 flex items-center justify-center mx-auto", s.avatar, s.avatarText)}>
             {deployedAgentEmoji(agent, def)}
           </div>
-          <span className={cn("absolute -bottom-0.5 -right-0.5 rounded-full border-2 border-card", s.dot, STATUS_DOT[agent.status] ?? "bg-muted")} />
+          <span className={cn("absolute -bottom-0.5 -right-0.5 rounded-full border-2 border-card", s.dot, STATUS_DOT[agentCardStatus(agent)] ?? "bg-muted")} />
         </div>
         <p className={cn("text-foreground truncate", s.nameText)}>{agent.displayName}</p>
         <p className="text-xs text-muted-foreground truncate">{agent.role}</p>
@@ -200,7 +202,7 @@ export default function OrgChart() {
   const [newTeamDescription, setNewTeamDescription] = useState("");
   const [newTeamColor, setNewTeamColor] = useState("#4f98a3");
 
-  const { data: agents = [] } = useQuery<Agent[]>({
+  const { data: agents = [] } = useQuery<(Agent & { displayStatus?: string })[]>({
     queryKey: ["/api/tenants", tid, "agents"],
     queryFn: () => apiRequest("GET", `/api/tenants/${tid}/agents`).then(r => r.json()),
   });
@@ -381,7 +383,7 @@ export default function OrgChart() {
 
       {/* Legend */}
       <div className="flex items-center gap-4 text-xs text-muted-foreground">
-        {Object.entries({ running: "Running", idle: "Idle", paused: "Paused", terminated: "Terminated" }).map(([s, label]) => (
+        {Object.entries({ running: "Running", idle: "Idle", paused: "Paused", error: "Error", terminated: "Terminated" }).map(([s, label]) => (
           <div key={s} className="flex items-center gap-1.5">
             <span className={cn("w-2.5 h-2.5 rounded-full", STATUS_DOT[s])} />
             <span>{label}</span>
@@ -530,7 +532,7 @@ export default function OrgChart() {
                           key={agent.id}
                           className={cn(
                             "absolute w-44 rounded-xl border p-3 text-center shadow-sm cursor-grab active:cursor-grabbing touch-none select-none",
-                            STATUS_COLORS[agent.status] ?? "border-border bg-card",
+                            STATUS_COLORS[agentCardStatus(agent)] ?? "border-border bg-card",
                           )}
                           style={{ left: pos.x, top: pos.y, zIndex: z }}
                           data-testid={`org-canvas-node-${agent.id}`}
@@ -543,7 +545,7 @@ export default function OrgChart() {
                             <span
                               className={cn(
                                 "absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full border-2 border-card",
-                                STATUS_DOT[agent.status] ?? "bg-muted",
+                                STATUS_DOT[agentCardStatus(agent)] ?? "bg-muted",
                               )}
                             />
                           </div>

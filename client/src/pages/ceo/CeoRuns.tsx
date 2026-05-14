@@ -45,6 +45,61 @@ function statusColor(s: AgentRun["status"]) {
   return "bg-muted/40 text-muted-foreground border-border";
 }
 
+/** Stored run.error is often a short code ("llm"); stderr has the real provider message. */
+const GENERIC_RUN_ERRORS = new Set(["", "llm", "prompt", "busy", "cooldown", "llm_error"]);
+
+function openRouterStyleMessage(parsed: unknown): string | null {
+  if (!parsed || typeof parsed !== "object") return null;
+  const o = parsed as Record<string, unknown>;
+  const inner = o.error;
+  if (inner && typeof inner === "object") {
+    const msg = (inner as { message?: string }).message;
+    const code = (inner as { code?: number }).code;
+    if (typeof msg === "string" && msg.trim()) {
+      return code != null ? `${msg.trim()} (code ${code})` : msg.trim();
+    }
+  }
+  if (typeof o.message === "string" && o.message.trim()) return o.message.trim();
+  return null;
+}
+
+/** Pull human-readable failure text from run events when DB `error` is generic. */
+function failureDetailFromEvents(events: AgentRunEvent[]): string | null {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (e.kind !== "stderr") continue;
+    const m = e.message;
+
+    const llmIdx = m.indexOf("llm error:");
+    if (llmIdx >= 0) {
+      const rest = m.slice(llmIdx + "llm error:".length).trim();
+      try {
+        const parsed = JSON.parse(rest) as unknown;
+        const msg = openRouterStyleMessage(parsed);
+        if (msg) return msg;
+      } catch {
+        /* not JSON */
+      }
+      if (rest.length > 0) return rest.slice(0, 4000);
+    }
+
+    if (m.includes("hermes-agent cli error:") || m.includes("system prompt failed")) {
+      return m.trim().slice(0, 4000);
+    }
+  }
+  return null;
+}
+
+function failureDisplayText(run: AgentRun, events: AgentRunEvent[]): string {
+  const raw = (run.error ?? "").trim();
+  if (raw && !GENERIC_RUN_ERRORS.has(raw)) return raw;
+  const fromEvents = failureDetailFromEvents(events);
+  if (fromEvents) return fromEvents;
+  const sum = (run.summary ?? "").trim();
+  if (sum) return sum;
+  return raw || "Unknown error";
+}
+
 export default function CeoRuns() {
   const { activeTenantId, activeTenant } = useTenantContext();
   const tid = activeTenantId ?? 0;
@@ -133,8 +188,10 @@ export default function CeoRuns() {
                             {new Date(r.startedAt).toLocaleTimeString()}
                           </div>
                         </div>
-                        <div className="mt-1 text-xs text-muted-foreground">
-                          {r.error ? `Error: ${r.error}` : (r.summary ?? "—")}
+                        <div className="mt-1 text-xs text-muted-foreground line-clamp-2">
+                          {r.error && !GENERIC_RUN_ERRORS.has(r.error.trim())
+                            ? `Error: ${r.error}`
+                            : r.summary ?? (r.error ? `Error: ${r.error}` : "—")}
                         </div>
                       </button>
                     );
@@ -194,7 +251,9 @@ export default function CeoRuns() {
                       {detail.run.status === "failed" ? (
                         <div className="border border-red-500/25 rounded-md p-3 bg-red-500/5">
                           <div className="text-xs text-muted-foreground mb-1">Failure details</div>
-                          <div className="text-sm">{detail.run.error ?? "Unknown error"}</div>
+                          <div className="text-sm whitespace-pre-wrap break-words leading-relaxed">
+                            {failureDisplayText(detail.run, detail.events)}
+                          </div>
                         </div>
                       ) : null}
 

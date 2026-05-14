@@ -3,6 +3,7 @@ import path from "path";
 import { AGENT_DOC_TYPES, type AgentDocType } from "./agentDocTemplates";
 import type { AgentDocs } from "./skillsRuntime";
 import { getAgentDocs, getEffectiveDefinitionSkills } from "./skillsRuntime";
+import { formatSkillsMarkdown } from "@shared/formatSkillsMarkdown";
 
 /** On-disk instructions for a deployed agent (per tenant + agent id). */
 export function agentInstanceInstructionsDir(tenantId: number, agentId: number) {
@@ -62,7 +63,8 @@ export async function writeAgentInstanceDocOverlays(
   await fs.promises.mkdir(dir, { recursive: true });
   for (const f of files) {
     if (!ALLOWED_INSTANCE_FILENAMES.has(f.filename)) continue;
-    await fs.promises.writeFile(path.join(dir, f.filename), f.markdown, "utf-8");
+    const markdown = f.filename === "SKILLS.md" ? formatSkillsMarkdown(f.markdown) : f.markdown;
+    await fs.promises.writeFile(path.join(dir, f.filename), markdown, "utf-8");
   }
 }
 

@@ -26,3 +26,8 @@ export function formatDistanceToNow(dateStr: string): string {
   if (hrs < 24) return `${hrs}h ago`;
   return `${Math.floor(hrs / 24)}d ago`;
 }
+
+/** Badge / counts: server sets `displayStatus` when latest finished run failed but row was forced `running`. */
+export function agentCardStatus(agent: { status: string; displayStatus?: string }) {
+  return agent.displayStatus ?? agent.status;
+}

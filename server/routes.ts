@@ -48,7 +48,14 @@ import {
   upsertAgentProfile,
   upsertAgentRuntimeSettings,
 } from "./agentConfiguration";
-import { ensureAgentRunsTables, getAgentRun, getRunEvents, listAgentRuns } from "./agentRuns";
+import {
+  ensureAgentRunsTables,
+  getAgentRun,
+  getRunEvents,
+  listAgentRuns,
+  reconcileAgentStatusWithLatestFinishedRun,
+  latestFinishedRunByAgent,
+} from "./agentRuns";
 import { ensureAgentBudgetTables, getAgentBudgetSettings, updateAgentBudgetSettings } from "./agentBudgets";
 import {
   ensureCeoControlTable,
@@ -839,6 +846,39 @@ export async function registerRoutes(httpServer: Server, app: Express) {
     });
   });
 
+  /** Create or update on-disk `SKILLS.md` for this deployed agent (instance override). */
+  app.put("/api/tenants/:tenantId/agents/:agentId/instance-docs/skills-md", async (req, res) => {
+    const tenantId = Number(req.params.tenantId);
+    const agentId = Number(req.params.agentId);
+    const tenant = storage.getTenant(tenantId);
+    if (!tenant) throw new ApiError(404, "not_found", "Tenant not found");
+    const agent = storage.getAgent(agentId);
+    if (!agent || agent.tenantId !== tenantId) throw new ApiError(404, "not_found", "Agent not found");
+    const def = storage.getAgentDefinition(agent.definitionId);
+    if (!def) throw new ApiError(404, "not_found", "Agent definition not found");
+
+    const markdown =
+      req.body != null && typeof (req.body as { markdown?: unknown }).markdown === "string"
+        ? (req.body as { markdown: string }).markdown
+        : "";
+
+    await materializeDefaultAgentInstanceDocs(tenantId, agentId, def.id);
+    await writeAgentInstanceDocOverlays(tenantId, agentId, [{ filename: "SKILLS.md", markdown }]);
+
+    auditAndInvalidate(tenantId, ["agents"], {
+      agentId,
+      agentName: agent.displayName,
+      action: "skills_instance_updated",
+      entity: "agent",
+      entityId: String(agentId),
+      detail: "Updated instance SKILLS.md",
+      tokensUsed: 0,
+      cost: 0,
+    });
+    invalidateTenant(tenantId, ["tenant"]);
+    res.json({ ok: true, hasInstanceSkillsFile: agentInstanceHasSkillsFile(tenantId, agentId) });
+  });
+
   // In-app run: Hermes (LLM loop) or OpenClaw (recorded run + gateway-oriented message). Same URL for UI parity.
   app.post("/api/tenants/:tenantId/agents/:agentId/hermes/run-once", async (req, res) => {
     const tenantId = Number(req.params.tenantId);
@@ -867,11 +907,32 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   app.get("/api/tenants/:tenantId/agents", (req, res) => {
     const tenantId = Number(req.params.tenantId);
     ensureAgentConfigurationTables();
+    reconcileAgentStatusWithLatestFinishedRun(tenantId);
     const list = storage.getAgents(tenantId);
+    const lastByAgent = latestFinishedRunByAgent(tenantId);
     const out = list.map((a) => {
       const rt = getAgentRuntimeSettings(a.id);
       const rm = String(rt.model ?? "").trim();
-      return { ...a, cardModel: rm || a.model };
+      const info = lastByAgent.get(Number(a.id));
+      const last = info?.status;
+      const displayStatus =
+        last === "failed" && a.status !== "paused" && a.status !== "terminated" ? "error" : a.status;
+      return {
+        ...a,
+        cardModel: rm || a.model,
+        displayStatus,
+        ...(info
+          ? {
+              latestFinishedRun: {
+                id: info.runId,
+                status: info.status,
+                trigger: info.trigger,
+                error: info.error,
+                summary: info.summary,
+              },
+            }
+          : {}),
+      };
     });
     res.json(out);
   });
@@ -936,6 +997,9 @@ export async function registerRoutes(httpServer: Server, app: Express) {
         storage.updateAgent(agentId, { status: nextStatus });
       }
     }
+
+    // Heartbeat / config can force `running` for any deployed agent — re-sync whole org from run logs.
+    reconcileAgentStatusWithLatestFinishedRun(tenantId);
 
     auditAndInvalidate(tenantId, ["agents"], {
       agentId,
@@ -1152,6 +1216,8 @@ export async function registerRoutes(httpServer: Server, app: Express) {
       } else {
         upsertAgentRuntimeSettings(ceo.id, { heartbeatEnabled: true });
         storage.updateAgent(ceo.id, { status: "running" } as any);
+        // Re-sync every agent in the org (not only CEO) with latest finished runs.
+        reconcileAgentStatusWithLatestFinishedRun(tenantId);
       }
     }
 
@@ -1196,17 +1262,58 @@ export async function registerRoutes(httpServer: Server, app: Express) {
       cost: 0,
     });
 
-    const becameRunning = req.body?.status === "running" && prev?.status !== "running";
-    if (becameRunning) {
-      void (async () => {
-        try {
-          await dispatchAgentRun(a.tenantId, a.id, { reason: "start" });
-        } catch {
-          // don't block status updates if the run fails
-        }
-      })();
+    const wantsRunning = req.body?.status === "running";
+    let firstRunOnStart:
+      | { ok: boolean; adapter: string; reason?: string; error?: string }
+      | undefined;
+
+    // My Agents "Start" must kick off a run even when the row is already `running` but the UI
+    // shows Error via `displayStatus` (last finished run failed). `becameRunning` alone skipped that.
+    if (wantsRunning && prev?.status !== "terminated") {
+      try {
+        const result = await dispatchAgentRun(a.tenantId, a.id, { reason: "start" });
+        firstRunOnStart = {
+          ok: !!(result as any).ok,
+          adapter: String((result as any).adapter ?? "unknown"),
+          reason: typeof (result as any).reason === "string" ? (result as any).reason : undefined,
+          error: typeof (result as any).error === "string" ? (result as any).error : undefined,
+        };
+      } catch (err: any) {
+        firstRunOnStart = {
+          ok: false,
+          adapter: "error",
+          error: String(err?.message ?? err ?? "dispatch_failed"),
+        };
+      }
     }
-    res.json(a);
+
+    reconcileAgentStatusWithLatestFinishedRun(a.tenantId);
+    const fresh = storage.getAgent(id) ?? a;
+    const lastByAgent = latestFinishedRunByAgent(a.tenantId);
+    const info = lastByAgent.get(Number(id));
+    const last = info?.status;
+    const displayStatus =
+      last === "failed" && fresh.status !== "paused" && fresh.status !== "terminated" ? "error" : fresh.status;
+    const rt = getAgentRuntimeSettings(id);
+    const cardModel = String(rt.model ?? "").trim() || fresh.model;
+
+    res.json({
+      ...fresh,
+      cardModel,
+      displayStatus,
+      ...(info
+        ? {
+            latestFinishedRun: {
+              id: info.runId,
+              status: info.status,
+              trigger: info.trigger,
+              error: info.error,
+              summary: info.summary,
+            },
+          }
+        : {}),
+      ...(firstRunOnStart ? { firstRunOnStart } : {}),
+    });
   });
   app.delete("/api/agents/:id", (req, res) => {
     const id = Number(req.params.id);

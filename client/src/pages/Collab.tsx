@@ -7,7 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Send, Hash, MessageSquare, Users, Zap, Download, FileCode, FolderDown } from "lucide-react";
-import { cn } from "@/lib/utils";
+import { cn, agentCardStatus } from "@/lib/utils";
 
 const MSG_TYPE_CONFIG: Record<string, { label: string; class: string }> = {
   chat: { label: "", class: "" },
@@ -170,7 +170,7 @@ export default function Collab() {
   const [senderName, setSenderName] = useState("You");
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  const { data: agents = [] } = useQuery<Agent[]>({
+  const { data: agents = [] } = useQuery<(Agent & { displayStatus?: string })[]>({
     queryKey: ["/api/tenants", tid, "agents"],
     queryFn: () => apiRequest("GET", `/api/tenants/${tid}/agents`).then(r => r.json()),
     enabled: tid > 0,
@@ -219,7 +219,7 @@ export default function Collab() {
   ];
 
   const activeChannelDef = channels.find(c => c.id === activeChannel);
-  const runningAgents = agents.filter(a => a.status === "running");
+  const runningAgents = agents.filter((a) => agentCardStatus(a) === "running");
 
   return (
     <div className="flex h-[calc(100vh-60px)] overflow-hidden">

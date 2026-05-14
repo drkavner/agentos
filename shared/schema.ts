@@ -103,7 +103,7 @@ export const agents = sqliteTable("agents", {
   model: text("model").notNull().default("claude-3-5-sonnet"),
   monthlyBudget: real("monthly_budget").notNull().default(50),
   spentThisMonth: real("spent_this_month").notNull().default(0),
-  status: text("status").notNull().default("idle"), // idle | running | paused | terminated
+  status: text("status").notNull().default("idle"), // idle | running | paused | error | terminated
   // Self-referencing FKs are omitted here to avoid TS circular inference issues.
   // Manager relationships are enforced at the application layer.
   managerId: integer("manager_id"), // reports to this agent

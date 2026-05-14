@@ -439,7 +439,12 @@ export async function cliRunOnce(
 
   finishAgentRun(run.id, {
     status: exitCode === 0 ? "ok" : "failed",
-    error: exitCode !== 0 ? (usedLlmFallback ? "llm_error" : `exit_code_${exitCode}`) : null,
+    error:
+      exitCode === 0
+        ? null
+        : String(output ?? "")
+            .trim()
+            .slice(0, 2000) || (usedLlmFallback ? "llm_error" : `exit_code_${exitCode}`),
     summary: [
       task ? `Task: ${task.title}` : "No pending tasks",
       usedLlmFallback ? `(LLM fallback: ${routing})` : `(CLI: ${cmdKey})`,

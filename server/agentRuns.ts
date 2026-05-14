@@ -1,5 +1,7 @@
 import { db } from "./db";
 import { sql } from "drizzle-orm";
+import { storage } from "./storage";
+import { invalidateTenant } from "./realtimeSideEffects";
 
 let ensured = false;
 
@@ -94,7 +96,14 @@ export function addRunEvent(
 export function finishAgentRun(runId: number, input: { status: RunStatus; summary?: string | null; error?: string | null }) {
   ensureAgentRunsTables();
   const endedAt = new Date().toISOString();
-  const run = db.get(sql`SELECT started_at as startedAt FROM agent_runs WHERE id = ${runId}`) as any | undefined;
+  const run = db.get(sql`
+    SELECT
+      started_at as startedAt,
+      agent_id as agentId,
+      tenant_id as tenantId
+    FROM agent_runs
+    WHERE id = ${runId}
+  `) as { startedAt?: string; agentId?: number; tenantId?: number } | undefined;
   const startedAt = run?.startedAt ? new Date(String(run.startedAt)) : null;
   const durationMs = startedAt && Number.isFinite(startedAt.getTime()) ? Date.now() - startedAt.getTime() : null;
   db.run(sql`
@@ -107,6 +116,125 @@ export function finishAgentRun(runId: number, input: { status: RunStatus; summar
     WHERE id = ${runId};
   `);
   addRunEvent(runId, { kind: "system", message: "run_finished", ts: endedAt });
+
+  const agentId = run?.agentId != null ? Number(run.agentId) : null;
+  const tenantId = run?.tenantId != null ? Number(run.tenantId) : null;
+  if (agentId != null && tenantId != null) {
+    const agent = storage.getAgent(agentId);
+    if (agent && agent.tenantId === tenantId) {
+      if (input.status === "failed" && agent.status !== "terminated") {
+        storage.updateAgent(agentId, { status: "error" });
+        invalidateTenant(tenantId, ["agents"]);
+      } else if (input.status === "ok" && agent.status === "error") {
+        storage.updateAgent(agentId, { status: "running" });
+        invalidateTenant(tenantId, ["agents"]);
+      }
+    }
+  }
+}
+
+/** Latest finished run per agent (max `agent_runs.id` with `ended_at` set). */
+export function latestFinishedRunStatusByAgent(tenantId: number): Map<number, RunStatus> {
+  ensureAgentRunsTables();
+  const rows = db.all(sql`
+    SELECT ar.agent_id as agentId, ar.status as status
+    FROM agent_runs ar
+    JOIN (
+      SELECT agent_id, MAX(id) as max_id
+      FROM agent_runs
+      WHERE tenant_id = ${tenantId} AND ended_at IS NOT NULL
+      GROUP BY agent_id
+    ) latest ON latest.agent_id = ar.agent_id AND ar.id = latest.max_id
+    WHERE ar.tenant_id = ${tenantId}
+  `) as { agentId: number; status: RunStatus }[];
+
+  const m = new Map<number, RunStatus>();
+  for (const r of rows) {
+    const id = Number(r.agentId);
+    if (Number.isFinite(id)) m.set(id, r.status);
+  }
+  return m;
+}
+
+/** Latest finished run per agent (same row as status map) — for UI error detail. */
+export type LatestFinishedRunInfo = {
+  runId: number;
+  status: RunStatus;
+  trigger: RunTrigger;
+  error: string | null;
+  summary: string | null;
+};
+
+export function latestFinishedRunByAgent(tenantId: number): Map<number, LatestFinishedRunInfo> {
+  ensureAgentRunsTables();
+  const rows = db.all(sql`
+    SELECT
+      ar.agent_id as agentId,
+      ar.id as runId,
+      ar.status as status,
+      ar.trigger as trigger,
+      ar.error as error,
+      ar.summary as summary
+    FROM agent_runs ar
+    JOIN (
+      SELECT agent_id, MAX(id) as max_id
+      FROM agent_runs
+      WHERE tenant_id = ${tenantId} AND ended_at IS NOT NULL
+      GROUP BY agent_id
+    ) latest ON latest.agent_id = ar.agent_id AND ar.id = latest.max_id
+    WHERE ar.tenant_id = ${tenantId}
+  `) as {
+    agentId: number;
+    runId: number;
+    status: RunStatus;
+    trigger: RunTrigger;
+    error: string | null;
+    summary: string | null;
+  }[];
+
+  const m = new Map<number, LatestFinishedRunInfo>();
+  for (const r of rows as any[]) {
+    const id = Number(r.agentId ?? r.agent_id);
+    if (!Number.isFinite(id)) continue;
+    m.set(id, {
+      runId: Number(r.runId ?? r.run_id),
+      status: r.status,
+      trigger: r.trigger,
+      error: r.error ?? null,
+      summary: r.summary ?? null,
+    });
+  }
+  return m;
+}
+
+/**
+ * If an agent is still marked `running` but their latest *finished* run failed (e.g. LLM error),
+ * align the row to `error` so My Agents matches Run logs. Covers historical rows from before
+ * `finishAgentRun` synced status, and any missed edge cases.
+ */
+export function reconcileAgentStatusWithLatestFinishedRun(tenantId: number) {
+  ensureAgentRunsTables();
+  const rows = db.all(sql`
+    SELECT a.id as agentId
+    FROM agents a
+    JOIN (
+      SELECT agent_id, MAX(id) as max_id
+      FROM agent_runs
+      WHERE tenant_id = ${tenantId} AND ended_at IS NOT NULL
+      GROUP BY agent_id
+    ) latest ON latest.agent_id = a.id
+    JOIN agent_runs last_run ON last_run.id = latest.max_id
+    WHERE a.tenant_id = ${tenantId}
+      AND a.status = 'running'
+      AND last_run.status = 'failed'
+  `) as { agentId: number }[];
+
+  if (rows.length === 0) return;
+  for (const r of rows) {
+    const id = Number(r.agentId);
+    if (Number.isFinite(id)) storage.updateAgent(id, { status: "error" });
+  }
+  invalidateTenant(tenantId, ["agents"]);
 }
 
 export function listAgentRuns(tenantId: number, agentId: number, limit = 50): AgentRunRow[] {

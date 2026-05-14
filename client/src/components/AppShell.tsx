@@ -5,7 +5,7 @@ import {
   LayoutDashboard, Bot, Users, Network, CheckSquare,
   MessageSquare, Settings, Building2, ScrollText,
   ChevronDown, ChevronRight, Zap, Moon, Sun, Menu, X,
-  Bell, Search, Crown
+  Search, Crown
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useTenantContext } from "@/tenant/TenantContext";
@@ -20,6 +20,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { HeaderActivityMenu } from "@/components/HeaderActivityMenu";
 
 const NAV = [
   {
@@ -105,7 +106,7 @@ export function AppShell({ children }: AppShellProps) {
             <div className="text-xs text-muted-foreground">Multi-Agent Platform</div>
           </div>
         )}
-        <button onClick={() => setSidebarOpen(v => !v)} className="ml-auto text-muted-foreground hover:text-foreground p-1 rounded hidden md:flex" data-testid="sidebar-toggle">
+        <button onClick={() => setSidebarOpen(v => !v)} className="ml-auto text-muted-foreground hover:text-sidebar-foreground p-1 rounded hidden md:flex" data-testid="sidebar-toggle">
           {sidebarOpen ? <ChevronRight className="w-4 h-4" /> : <ChevronDown className="w-4 h-4 rotate-90" />}
         </button>
       </div>
@@ -145,7 +146,7 @@ export function AppShell({ children }: AppShellProps) {
         {nav.map(group => (
           <div key={group.label}>
             {sidebarOpen && (
-              <div className="px-2 mb-1 text-xs font-semibold uppercase tracking-widest text-muted-foreground/60">
+              <div className="px-2 mb-1 text-xs font-semibold uppercase tracking-widest text-muted-foreground">
                 {group.label}
               </div>
             )}
@@ -184,7 +185,7 @@ export function AppShell({ children }: AppShellProps) {
         <div className="px-3 py-3 border-t border-sidebar-border">
           <div className="flex items-center justify-between mb-1.5">
             <span className="text-xs text-muted-foreground">Monthly Budget</span>
-            <span className="text-xs font-medium text-foreground">
+            <span className="text-xs font-medium text-sidebar-foreground tabular-nums">
               ${activeTenant.spentThisMonth.toFixed(0)} / ${activeTenant.monthlyBudget.toFixed(0)}
             </span>
           </div>
@@ -233,10 +234,7 @@ export function AppShell({ children }: AppShellProps) {
             />
           </div>
           <div className="ml-auto flex items-center gap-2">
-            <button className="relative text-muted-foreground hover:text-foreground p-1.5 rounded-md hover:bg-accent/10" data-testid="notifications">
-              <Bell className="w-4 h-4" />
-              <span className="absolute top-0.5 right-0.5 w-2 h-2 rounded-full bg-primary" />
-            </button>
+            <HeaderActivityMenu tenantId={tid} />
             <button onClick={() => setDark(v => !v)} className="text-muted-foreground hover:text-foreground p-1.5 rounded-md hover:bg-accent/10" data-testid="theme-toggle">
               {dark ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
             </button>

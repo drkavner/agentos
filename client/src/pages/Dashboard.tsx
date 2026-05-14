@@ -6,8 +6,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { Bot, CheckSquare, DollarSign, TrendingUp, Clock, Zap, Target, AlertCircle } from "lucide-react";
-import { cn } from "@/lib/utils";
-import { formatDistanceToNow } from "../lib/utils";
+import { agentCardStatus, cn, formatDistanceToNow } from "@/lib/utils";
 
 function StatCard({ label, value, sub, icon: Icon, accent }: { label: string; value: string | number; sub?: string; icon: any; accent?: string }) {
   return (
@@ -33,6 +32,7 @@ function AgentStatusDot({ status }: { status: string }) {
     running: "bg-green-500 status-running",
     idle: "bg-yellow-500",
     paused: "bg-orange-500",
+    error: "bg-destructive",
     terminated: "bg-red-500",
   };
   return <span className={cn("inline-block w-2 h-2 rounded-full flex-shrink-0", colors[status] ?? "bg-gray-500")} />;
@@ -47,7 +47,7 @@ export default function Dashboard() {
     queryFn: () => apiRequest("GET", `/api/tenants/${tid}`).then(r => r.json()),
   });
 
-  const { data: agents = [] } = useQuery<Agent[]>({
+  const { data: agents = [] } = useQuery<(Agent & { displayStatus?: string })[]>({
     queryKey: ["/api/tenants", tid, "agents"],
     queryFn: () => apiRequest("GET", `/api/tenants/${tid}/agents`).then(r => r.json()),
   });
@@ -67,7 +67,7 @@ export default function Dashboard() {
     queryFn: () => apiRequest("GET", `/api/tenants/${tid}/messages?channelId=general`).then(r => r.json()),
   });
 
-  const runningAgents = agents.filter(a => a.status === "running").length;
+  const runningAgents = agents.filter((a) => agentCardStatus(a) === "running").length;
   const doneTasks = tasks.filter(t => t.status === "done").length;
   const inProgressTasks = tasks.filter(t => t.status === "in_progress").length;
   const blockedTasks = tasks.filter(t => t.status === "blocked").length;
@@ -136,7 +136,7 @@ export default function Dashboard() {
                   {agents.slice(0, 5).map(a => (
                     <div key={a.id} className="flex items-center justify-between">
                       <div className="flex items-center gap-2">
-                        <AgentStatusDot status={a.status} />
+                        <AgentStatusDot status={agentCardStatus(a)} />
                         <span className="text-xs text-muted-foreground">{a.displayName}</span>
                       </div>
                       <span className="text-xs font-mono text-foreground">${a.spentThisMonth.toFixed(2)}</span>
@@ -159,7 +159,7 @@ export default function Dashboard() {
             <CardContent className="space-y-2 overflow-y-auto max-h-[500px]">
               {agents.map(a => (
                 <div key={a.id} className="flex items-center gap-3 p-2.5 rounded-lg hover:bg-muted/50 transition-colors" data-testid={`agent-card-${a.id}`}>
-                  <AgentStatusDot status={a.status} />
+                  <AgentStatusDot status={agentCardStatus(a)} />
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
                       <span className="text-sm font-medium text-foreground truncate">{a.displayName}</span>
