@@ -22,6 +22,7 @@ import CeoSkills from "./pages/ceo/CeoSkills";
 import CeoConfiguration from "./pages/ceo/CeoConfiguration";
 import CeoRuns from "./pages/ceo/CeoRuns";
 import CeoBudgets from "./pages/ceo/CeoBudgets";
+import Pricing from "./pages/Pricing";
 
 export default function App() {
   return (
@@ -46,6 +47,7 @@ export default function App() {
               <Route path="/ceo/configuration" component={CeoConfiguration} />
               <Route path="/ceo/runs" component={CeoRuns} />
               <Route path="/ceo/budgets" component={CeoBudgets} />
+              <Route path="/pricing" component={Pricing} />
               <Route component={NotFound} />
             </Switch>
           </AppShell>

@@ -708,7 +708,11 @@ export async function registerRoutes(httpServer: Server, app: Express) {
   });
 
   // ─── Agent Definitions ────────────────────────────────────────────────────
-  app.get("/api/agent-definitions", (req, res) => res.json(storage.getAgentDefinitions()));
+  // Demo build: pre-built role templates are not shipped. The single internal
+  // "Agents Orchestrator" row (used by CEO bootstrap) is hidden from clients.
+  app.get("/api/agent-definitions", (req, res) =>
+    res.json(storage.getAgentDefinitions().filter((d) => d.source !== "internal"))
+  );
 
   app.post("/api/agent-definitions", (req, res) => {
     const body = req.body ?? {};
@@ -728,7 +732,11 @@ export async function registerRoutes(httpServer: Server, app: Express) {
     res.status(201).json(def);
   });
   app.get("/api/agent-definitions/division/:division", (req, res) =>
-    res.json(storage.getAgentDefinitionsByDivision(req.params.division))
+    res.json(
+      storage
+        .getAgentDefinitionsByDivision(req.params.division)
+        .filter((d) => d.source !== "internal")
+    )
   );
   app.get("/api/agent-definitions/:id/skills", async (req, res) => {
     const id = Number(req.params.id);

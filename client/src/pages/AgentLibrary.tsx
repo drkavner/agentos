@@ -6,7 +6,8 @@ import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { Search, Plus, Filter, Rocket } from "lucide-react";
+import { Search, Plus, Filter, Rocket, Sparkles, Lock } from "lucide-react";
+import { useLocation } from "wouter";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter,
 } from "@/components/ui/dialog";
@@ -23,6 +24,7 @@ export default function AgentLibrary() {
   const { activeTenantId } = useTenantContext();
   const tid = activeTenantId ?? 0;
   const { toast } = useToast();
+  const [, setLocation] = useLocation();
   const [search, setSearch] = useState("");
   const [division, setDivision] = useState("All");
   const [viewMode, setViewMode] = useState<(typeof VIEW_MODES)[number]>("Library");
@@ -106,7 +108,11 @@ export default function AgentLibrary() {
       <div className="flex items-start justify-between gap-4">
         <div>
           <h1 className="text-xl font-bold text-foreground">Agent Library</h1>
-          <p className="text-sm text-muted-foreground mt-0.5">{defs.length} specialized agents across {DIVISIONS.length - 1} divisions</p>
+          <p className="text-sm text-muted-foreground mt-0.5">
+            {defs.length === 0
+              ? "Pre-built templates are part of the full version"
+              : `${defs.length} specialized agents across ${DIVISIONS.length - 1} divisions`}
+          </p>
         </div>
         <Button onClick={() => openWizard()} data-testid="hire-from-library-btn">
           <Plus className="w-4 h-4 mr-1.5" /> Hire Agent
@@ -166,7 +172,36 @@ export default function AgentLibrary() {
         ))}
       </div>
 
-      {viewMode === "Library" ? (
+      {viewMode === "Library" && defs.length === 0 ? (
+        <div className="rounded-xl border border-border bg-card p-8 text-center max-w-2xl mx-auto">
+          <div className="w-12 h-12 rounded-full bg-primary/10 flex items-center justify-center mx-auto mb-4">
+            <Sparkles className="w-6 h-6 text-primary" />
+          </div>
+          <h2 className="text-lg font-semibold text-foreground">
+            Agent templates ship with the full version
+          </h2>
+          <p className="text-sm text-muted-foreground mt-2 leading-relaxed">
+            This is the AgentOS demo build. The full version includes 40+
+            pre-built agent roles across Engineering, Design, Marketing, Sales,
+            Product, Finance, and Support — hire any of them in one click.
+          </p>
+          <div className="mt-5 flex items-center justify-center gap-2">
+            <Button
+              variant="outline"
+              onClick={() => setLocation("/agents/my-agents")}
+              data-testid="library-explore-my-agents"
+            >
+              Explore your agents
+            </Button>
+            <Button
+              onClick={() => setLocation("/pricing")}
+              data-testid="library-upgrade-btn"
+            >
+              <Lock className="w-4 h-4 mr-1.5" /> Get the full version
+            </Button>
+          </div>
+        </div>
+      ) : viewMode === "Library" ? (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
           {filtered.map(def => (
             <Card
